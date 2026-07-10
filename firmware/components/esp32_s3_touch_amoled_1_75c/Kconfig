@@ -1,0 +1,50 @@
+menu "Board Support Package"
+    config BSP_ERROR_CHECK
+        bool "Enable error check in BSP"
+        default y
+
+    config BSP_DEBUG_DIAGNOSTICS
+        bool "Enable display boot diagnostics"
+        default n
+        help
+            Draw LCD diagnostic color bars and pause during display start.
+
+    menu "I2C"
+        config BSP_I2C_NUM
+            int "I2C peripheral index"
+            default 1
+            range 0 1
+
+        config BSP_I2C_FAST_MODE
+            bool "Enable I2C fast mode"
+            default y
+
+        config BSP_I2C_CLK_SPEED_HZ
+            int
+            default 400000 if BSP_I2C_FAST_MODE
+            default 100000
+    endmenu
+
+    menu "SPIFFS - Virtual File System"
+        config BSP_SPIFFS_FORMAT_ON_MOUNT_FAIL
+            bool "Format SPIFFS if mounting fails"
+            default n
+
+        config BSP_SPIFFS_MOUNT_POINT
+            string "SPIFFS mount point"
+            default "/spiffs"
+
+        config BSP_SPIFFS_PARTITION_LABEL
+            string "Partition label of SPIFFS"
+            default "storage"
+
+        config BSP_SPIFFS_MAX_FILES
+            int "Maximum open SPIFFS files"
+            default 2
+    endmenu
+
+    config BSP_I2S_NUM
+        int "I2S peripheral index"
+        default 1
+        range 0 1
+endmenu

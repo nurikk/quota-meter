@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments and local credentials
+.venv
+.env
+
+# PlatformIO and ESP-IDF generated files
+firmware/.pio/
+firmware/managed_components/
+firmware/sdkconfig.jc3248w535en
+
+# Subagent run artifacts
+.pi-subagents/

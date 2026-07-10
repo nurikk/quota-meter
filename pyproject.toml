@@ -1,0 +1,22 @@
+[project]
+name = "quota-meter"
+version = "0.1.0"
+description = "A small CLI for viewing OpenAI Codex and Claude subscription quotas"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["qrcode>=8.2"]
+
+[project.scripts]
+quota-meter = "quota_meter.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.4.1", "ruff>=0.12.2"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
