@@ -18,6 +18,8 @@ struct TokenBundle {
 };
 esp_err_t token_store_save(Provider provider, const TokenBundle &bundle);
 esp_err_t token_store_load(Provider provider, TokenBundle *bundle);
+esp_err_t quota_store_save(Provider provider, const ProviderStatus &status);
+esp_err_t quota_store_load(Provider provider, ProviderStatus *status);
 esp_err_t token_store_remove(Provider provider);
 void secure_clear(void *value, size_t length);
 }

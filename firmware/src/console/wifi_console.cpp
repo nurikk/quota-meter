@@ -174,18 +174,34 @@ int token_commit_command(int argc, char **argv)
     return 0;
 }
 
+void print_provider_status(const char *name, const ProviderStatus &status)
+{
+    printf("%s auth=%u quota=%u error=%u plan=%s windows=%u fetched=%lld\n", name,
+           static_cast<unsigned>(status.auth), static_cast<unsigned>(status.quota),
+           static_cast<unsigned>(status.error), status.plan[0] ? status.plan : "--",
+           status.window_count, static_cast<long long>(status.fetched_at));
+    for (uint8_t index = 0; index < status.window_count; ++index) {
+        const QuotaWindow &window = status.windows[index];
+        printf("  window[%u] label=%s used=%.1f%% duration=%ldm reset=%lld model=%u\n", index,
+               window.label, static_cast<double>(window.used_percent),
+               static_cast<long>(window.window_minutes), static_cast<long long>(window.resets_at),
+               window.model_limit ? 1U : 0U);
+    }
+    if (status.extra_usage.present) {
+        printf("  extra enabled=%u utilization=%s%.3f%%\n", status.extra_usage.is_enabled ? 1U : 0U,
+               status.extra_usage.has_utilization ? "" : "unavailable ",
+               static_cast<double>(status.extra_usage.utilization));
+    }
+}
+
 int status_command(int argc, char **)
 {
     if (argc != 1) return 1;
     const AppSnapshot snapshot = app_state_get();
     printf("Wi-Fi state=%u ip=%s time=%lld\n", static_cast<unsigned>(snapshot.wifi), snapshot.sta_ip,
            static_cast<long long>(time(nullptr)));
-    printf("Codex auth=%u quota=%u error=%u windows=%u fetched=%lld\n", static_cast<unsigned>(snapshot.openai.auth),
-           static_cast<unsigned>(snapshot.openai.quota), static_cast<unsigned>(snapshot.openai.error),
-           snapshot.openai.window_count, static_cast<long long>(snapshot.openai.fetched_at));
-    printf("Claude auth=%u quota=%u error=%u windows=%u fetched=%lld\n", static_cast<unsigned>(snapshot.claude.auth),
-           static_cast<unsigned>(snapshot.claude.quota), static_cast<unsigned>(snapshot.claude.error),
-           snapshot.claude.window_count, static_cast<long long>(snapshot.claude.fetched_at));
+    print_provider_status("Codex", snapshot.openai);
+    print_provider_status("Claude", snapshot.claude);
     return 0;
 }
 

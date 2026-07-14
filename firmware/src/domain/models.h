@@ -17,6 +17,27 @@ struct QuotaWindow {
     float used_percent{};
     int64_t resets_at{};
     bool present{};
+    bool model_limit{};
+    int32_t window_minutes{};
+};
+
+struct ClaudeExtraUsage {
+    bool present{};
+    bool is_enabled{};
+    bool has_utilization{};
+    float utilization{};
+    bool has_used_credits{};
+    double used_credits{};
+    bool has_monthly_limit{};
+    double monthly_limit{};
+    bool has_spend{};
+    double spend{};
+    bool has_spend_percent{};
+    float spend_percent{};
+    uint8_t decimal_places{};
+    uint8_t spend_decimal_places{};
+    uint8_t limit_decimal_places{};
+    char currency[8]{};
 };
 
 struct ProviderStatus {
@@ -28,6 +49,7 @@ struct ProviderStatus {
     char user_code[32];
     QuotaWindow windows[8];
     uint8_t window_count;
+    ClaudeExtraUsage extra_usage;
     int64_t fetched_at;
 };
 

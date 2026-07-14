@@ -158,18 +158,35 @@ static void add_window(ProviderStatus *status, const char *label, cJSON *window)
     if (!cJSON_IsNumber(used)) return;
     QuotaWindow &target = status->windows[status->window_count++]; memset(&target, 0, sizeof(target));
     snprintf(target.label, sizeof(target.label), "%s", label); target.used_percent = static_cast<float>(used->valuedouble); target.present = true;
-    cJSON *reset = cJSON_GetObjectItemCaseSensitive(window, "reset_at"); if (!cJSON_IsNumber(reset)) reset = cJSON_GetObjectItemCaseSensitive(window, "resets_at");
+    cJSON *reset = cJSON_GetObjectItemCaseSensitive(window, "reset_at");
+    if (!cJSON_IsNumber(reset)) reset = cJSON_GetObjectItemCaseSensitive(window, "resets_at");
+    if (!cJSON_IsNumber(reset)) reset = cJSON_GetObjectItemCaseSensitive(window, "resetsAt");
     if (cJSON_IsNumber(reset)) target.resets_at = static_cast<int64_t>(reset->valuedouble);
+    cJSON *minutes = cJSON_GetObjectItemCaseSensitive(window, "window_duration_mins");
+    if (!cJSON_IsNumber(minutes)) minutes = cJSON_GetObjectItemCaseSensitive(window, "windowDurationMins");
+    if (cJSON_IsNumber(minutes) && minutes->valuedouble > 0) {
+        target.window_minutes = static_cast<int32_t>(minutes->valuedouble);
+    } else {
+        cJSON *seconds = cJSON_GetObjectItemCaseSensitive(window, "limit_window_seconds");
+        if (cJSON_IsNumber(seconds) && seconds->valuedouble > 0) {
+            target.window_minutes = static_cast<int32_t>(seconds->valuedouble / 60);
+        }
+    }
 }
 
 bool parse_openai_usage(const char *json, size_t length, ProviderStatus *status)
 {
     if (!status) return false; cJSON *root = parse_bounded(json, length); if (!root || !cJSON_IsObject(root)) { cJSON_Delete(root); return false; }
     status->window_count = 0; cJSON *plan = cJSON_GetObjectItemCaseSensitive(root, "plan_type");
+    if (!cJSON_IsString(plan)) plan = cJSON_GetObjectItemCaseSensitive(root, "planType");
     if (cJSON_IsString(plan) && strlen(plan->valuestring) < sizeof(status->plan)) strcpy(status->plan, plan->valuestring);
     cJSON *rate = cJSON_GetObjectItemCaseSensitive(root, "rate_limit"); if (!cJSON_IsObject(rate)) rate = root;
-    add_window(status, "Primary", cJSON_GetObjectItemCaseSensitive(rate, "primary_window"));
-    add_window(status, "Secondary", cJSON_GetObjectItemCaseSensitive(rate, "secondary_window"));
+    cJSON *primary = cJSON_GetObjectItemCaseSensitive(rate, "primary_window");
+    if (!cJSON_IsObject(primary)) primary = cJSON_GetObjectItemCaseSensitive(rate, "primary");
+    cJSON *secondary = cJSON_GetObjectItemCaseSensitive(rate, "secondary_window");
+    if (!cJSON_IsObject(secondary)) secondary = cJSON_GetObjectItemCaseSensitive(rate, "secondary");
+    add_window(status, "Primary", primary);
+    add_window(status, "Secondary", secondary);
     cJSON_Delete(root); return status->window_count > 0;
 }
 }

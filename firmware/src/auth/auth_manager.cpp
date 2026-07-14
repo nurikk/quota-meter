@@ -10,6 +10,7 @@
 #include "../providers/openai_protocol.h"
 #include "../providers/cJSON.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -21,6 +22,13 @@
 #include <time.h>
 
 namespace qm {
+
+static constexpr char TAG[] = "quota_auth";
+
+static const char *provider_name(Provider provider)
+{
+    return provider == Provider::OpenAI ? "Codex" : "Claude";
+}
 
 enum class CommandType : uint8_t { Start, Callback, Refresh, Logout };
 struct Command { CommandType type; Provider provider; char callback[2049]; };
@@ -39,6 +47,36 @@ static TokenBundle *next_bundle;
 
 static size_t index(Provider provider) { return provider == Provider::OpenAI ? 0 : 1; }
 
+static int64_t next_refresh_slot(Provider provider, int64_t earliest)
+{
+    int64_t minute = (earliest + 59) / 60;
+    const int64_t parity = provider == Provider::OpenAI ? 0 : 1;
+    if (minute % 2 != parity) ++minute;
+    return minute * 60;
+}
+
+static void schedule_refresh(Provider provider, int64_t earliest)
+{
+    const int64_t next = next_refresh_slot(provider, earliest);
+    next_auto_refresh[index(provider)] = next;
+    ESP_LOGI(TAG, "%s next automatic refresh=%lld", provider_name(provider),
+             static_cast<long long>(next));
+}
+
+static void log_quota(Provider provider, const ProviderStatus &status)
+{
+    ESP_LOGI(TAG, "%s quota refreshed plan=%s windows=%u fetched=%lld", provider_name(provider),
+             status.plan[0] ? status.plan : "--", status.window_count,
+             static_cast<long long>(status.fetched_at));
+    for (uint8_t window_index = 0; window_index < status.window_count; ++window_index) {
+        const QuotaWindow &window = status.windows[window_index];
+        ESP_LOGI(TAG, "%s window[%u] label=%s used=%.1f%% duration=%ldm reset=%lld",
+                 provider_name(provider), window_index, window.label,
+                 static_cast<double>(window.used_percent), static_cast<long>(window.window_minutes),
+                 static_cast<long long>(window.resets_at));
+    }
+}
+
 static void publish_error(Provider provider, ErrorCode error)
 {
     AppSnapshot snapshot = app_state_get();
@@ -46,6 +84,7 @@ static void publish_error(Provider provider, ErrorCode error)
     if (error == ErrorCode::Unauthorized || error == ErrorCode::Forbidden || error == ErrorCode::None) status.auth = AuthState::SignedOut;
     else status.auth = have_bundle[index(provider)] ? AuthState::Authenticated : AuthState::Error;
     status.error = error;
+    if (error != ErrorCode::None) status.quota = quota_after_failure(status.fetched_at > 0);
     status.quota = quota_after_failure(status.window_count > 0);
     app_state_set_provider(provider, status);
 }
@@ -132,13 +171,20 @@ static void fetch_quota(Provider provider)
 {
     size_t i = index(provider);
     if (!have_bundle[i]) return;
-    if (bundles[i].expires_at <= time(nullptr) + 300 && !refresh_token(provider)) return;
+    ESP_LOGI(TAG, "%s quota refresh starting", provider_name(provider));
+    if (bundles[i].expires_at <= time(nullptr) + 300 && !refresh_token(provider)) {
+        ESP_LOGW(TAG, "%s token refresh failed", provider_name(provider));
+        schedule_refresh(provider, time(nullptr) + 60);
+        return;
+    }
 
     for (int attempt = 0; attempt < 2; ++attempt) {
         char bearer[4110];
         int count = snprintf(bearer, sizeof(bearer), "Bearer %s", bundles[i].oauth.access_token);
         if (count <= 0 || static_cast<size_t>(count) >= sizeof(bearer)) {
             publish_error(provider, ErrorCode::InvalidResponse);
+            ESP_LOGE(TAG, "%s bearer header could not be created", provider_name(provider));
+            schedule_refresh(provider, time(nullptr) + 60);
             return;
         }
         HttpRequest request{HttpMethod::Get,
@@ -148,8 +194,10 @@ static void fetch_quota(Provider provider)
         https_request(request, http_result);
         secure_clear(bearer, sizeof(bearer));
         if (http_result->status == 401 && attempt == 0) {
+            ESP_LOGW(TAG, "%s quota request unauthorized; refreshing token", provider_name(provider));
             secure_clear(http_result, sizeof(*http_result));
             if (refresh_token(provider)) continue;
+            schedule_refresh(provider, time(nullptr) + 60);
             return;
         }
         break;
@@ -158,29 +206,41 @@ static void fetch_quota(Provider provider)
     AppSnapshot snapshot = app_state_get();
     ProviderStatus status = provider == Provider::OpenAI ? snapshot.openai : snapshot.claude;
     if (http_result->status != 200 || http_result->error != ErrorCode::None) {
+        const int http_status = http_result->status;
         ErrorCode error = http_result->error;
         uint32_t retry_after = http_result->retry_after;
         secure_clear(http_result, sizeof(*http_result));
         status.error = error;
         status.quota = quota_after_failure(status.window_count > 0);
         app_state_set_provider(provider, status);
-        next_auto_refresh[i] = time(nullptr) + (error == ErrorCode::Throttled && retry_after > 60 ? retry_after : 60);
+        const int64_t earliest = time(nullptr) + (retry_after > 60 ? retry_after : 60);
+        ESP_LOGW(TAG, "%s quota refresh failed http=%d error=%u retry_after=%u",
+                 provider_name(provider), http_status, static_cast<unsigned>(error), retry_after);
+        schedule_refresh(provider, earliest);
         return;
     }
+    ProviderStatus parsed_status = status;
     bool parsed = provider == Provider::OpenAI
-        ? parse_openai_usage(http_result->body, http_result->body_len, &status)
-        : parse_claude_usage(http_result->body, http_result->body_len, &status);
+        ? parse_openai_usage(http_result->body, http_result->body_len, &parsed_status)
+        : parse_claude_usage(http_result->body, http_result->body_len, &parsed_status);
     secure_clear(http_result, sizeof(*http_result));
     if (!parsed) {
         status.error = ErrorCode::InvalidResponse;
         status.quota = quota_after_failure(status.window_count > 0);
+        ESP_LOGW(TAG, "%s quota response could not be parsed", provider_name(provider));
     } else {
+        status = parsed_status;
         status.auth = AuthState::Authenticated;
         status.quota = QuotaState::Fresh;
         status.error = ErrorCode::None;
         status.fetched_at = time(nullptr);
+        const esp_err_t stored = quota_store_save(provider, status);
+        if (stored != ESP_OK) {
+            ESP_LOGW(TAG, "%s quota cache save failed error=%d", provider_name(provider), stored);
+        }
+        log_quota(provider, status);
     }
-    next_auto_refresh[i] = time(nullptr) + 60;
+    schedule_refresh(provider, time(nullptr) + 60);
     app_state_set_provider(provider, status);
 }
 
@@ -407,10 +467,15 @@ void auth_worker_task(void *)
             }
             have_bundle[i] = true;
             ProviderStatus status{};
+            if (quota_store_load(provider, &status) == ESP_OK) status.quota = QuotaState::Stale;
             status.auth = AuthState::Authenticated;
             app_state_set_provider(provider, status);
+            ESP_LOGI(TAG, "%s credentials loaded cached_windows=%u fetched=%lld",
+                     provider_name(provider), status.window_count,
+                     static_cast<long long>(status.fetched_at));
         }
     }
+    int64_t last_wall_time = 0;
     while (true) {
         Command command{};
         if (xQueueReceive(queue_handle, &command, pdMS_TO_TICKS(5000)) == pdTRUE) {
@@ -440,10 +505,16 @@ void auth_worker_task(void *)
             }
         } else if (app_state_get().wifi == WifiState::Connected && time_sync_start_and_wait() == ESP_OK) {
             int64_t now = time(nullptr);
-            for (Provider provider : {Provider::OpenAI, Provider::Claude}) {
-                size_t i = index(provider);
-                if (have_bundle[i] && now >= next_auto_refresh[i]) fetch_quota(provider);
+            if (last_wall_time > 0 && now < last_wall_time) {
+                ESP_LOGW(TAG, "Wall clock moved backward from %lld to %lld; resetting refresh schedule",
+                         static_cast<long long>(last_wall_time), static_cast<long long>(now));
+                next_auto_refresh[0] = 0;
+                next_auto_refresh[1] = 0;
             }
+            last_wall_time = now;
+            Provider provider = (now / 60) % 2 == 0 ? Provider::OpenAI : Provider::Claude;
+            size_t i = index(provider);
+            if (have_bundle[i] && now >= next_auto_refresh[i]) fetch_quota(provider);
         }
     }
 }

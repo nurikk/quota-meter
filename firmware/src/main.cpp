@@ -2,6 +2,7 @@
 #include "app/app_state.h"
 #include "auth/auth_manager.h"
 #include "console/wifi_console.h"
+#include "net/time_sync.h"
 #include "portal/wifi_portal.h"
 #include "ui/ui.h"
 #include "bsp/esp-bsp.h"
@@ -29,6 +30,7 @@ extern "C" void app_main(void)
         result = nvs_flash_init();
     }
     ESP_ERROR_CHECK(result);
+    qm::configure_london_timezone();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     qm::app_state_init();
