@@ -14,6 +14,11 @@
 #include <string.h>
 #include <time.h>
 
+extern "C" {
+LV_IMAGE_DECLARE(CLAUDE_LOGO);
+LV_IMAGE_DECLARE(CODEX_LOGO);
+}
+
 namespace qm {
 namespace {
 
@@ -78,12 +83,12 @@ constexpr int DASHBOARD_BAR_CAPTION_X = 440;
 constexpr int DASHBOARD_BAR_CAPTION_Y_OFFSET = -3;
 constexpr int DASHBOARD_BAR_CAPTION_WIDTH = DASHBOARD_PERCENT_RIGHT - DASHBOARD_BAR_CAPTION_X;
 
-constexpr int QUOTA_PERIOD_X = 26;
-constexpr int QUOTA_PERIOD_WIDTH = 62;
+constexpr int QUOTA_PERIOD_X = 64;
+constexpr int QUOTA_PERIOD_WIDTH = 40;
 constexpr int QUOTA_USED_CAPTION_Y_OFFSET = 30;
-constexpr int QUOTA_USED_X = 104;
+constexpr int QUOTA_USED_X = 112;
 constexpr int QUOTA_USED_WIDTH = 100;
-constexpr int QUOTA_USED_CAPTION_X = 105;
+constexpr int QUOTA_USED_CAPTION_X = 113;
 constexpr int QUOTA_VALUE_CAPTION_WIDTH = 50;
 constexpr int QUOTA_COUNTDOWN_X = 276;
 constexpr int QUOTA_COUNTDOWN_Y_OFFSET = 2;
@@ -95,10 +100,9 @@ constexpr int QUOTA_USAGE_BAR_Y_OFFSET = 50;
 constexpr int QUOTA_ELAPSED_BAR_Y_OFFSET = 78;
 constexpr int COUNTDOWN_LETTER_SPACE = 2;
 
-constexpr int PROVIDER_GLYPH_X = CONTENT_LEFT;
-constexpr int PROVIDER_GLYPH_Y = 8;
-constexpr int PROVIDER_GLYPH_SIZE = 16;
-constexpr int PROVIDER_GLYPH_LINE_WIDTH = 2;
+constexpr int PROVIDER_LOGO_X = CONTENT_LEFT;
+constexpr int PROVIDER_LOGO_Y = 4;
+constexpr int PROVIDER_LOGO_SIZE = 48;
 constexpr int DASHBOARD_FOOTER_Y = SCREEN_HEIGHT - 14;
 constexpr int DASHBOARD_ZONE_WIDTH = 50;
 constexpr int DASHBOARD_FOOTER_X = 250;
@@ -162,21 +166,13 @@ Provider pending_provider;
 struct QuotaBinding {
     QuotaWindow window;
     int window_minutes;
-    uint32_t accent;
     lv_obj_t *countdown;
-    lv_obj_t *usage_bar;
     lv_obj_t *elapsed_bar;
     lv_obj_t *elapsed_caption;
 };
 
 QuotaBinding quota_bindings[MAX_QUOTA_BINDINGS];
 size_t quota_binding_count;
-
-const lv_point_precise_t CODEX_GLYPH[] = {{6, 0}, {11, 3}, {11, 9}, {6, 12}, {1, 9}, {1, 3}, {6, 0}};
-const lv_point_precise_t CLAUDE_GLYPH[] = {
-    {6, 0}, {7, 4}, {11, 2}, {8, 5}, {12, 6}, {8, 7}, {10, 11}, {7, 8}, {6, 12},
-    {5, 8}, {2, 11}, {4, 7}, {0, 6}, {4, 5}, {1, 2}, {5, 4}, {6, 0},
-};
 
 const char *page_name(ConnectionPage page)
 {
@@ -312,15 +308,6 @@ void divider(lv_obj_t *parent, int y)
     lv_obj_set_style_radius(line, 0, 0);
 }
 
-uint32_t risk_color(uint32_t accent, float used, float elapsed)
-{
-    switch (usage_risk(used, elapsed)) {
-    case UsageRisk::Warning: return COLOR_WARNING;
-    case UsageRisk::High: return COLOR_HIGH;
-    case UsageRisk::Normal: return accent;
-    }
-    return accent;
-}
 
 lv_obj_t *dashboard_bar(lv_obj_t *parent, int y, const char *prefix, float percent, uint32_t color,
                         lv_obj_t **caption_output = nullptr)
@@ -348,13 +335,12 @@ lv_obj_t *dashboard_bar(lv_obj_t *parent, int y, const char *prefix, float perce
     return bar;
 }
 
-void add_quota_binding(const QuotaWindow *window, int window_minutes, uint32_t accent, lv_obj_t *countdown,
-                       lv_obj_t *usage_bar = nullptr, lv_obj_t *elapsed_bar = nullptr,
-                       lv_obj_t *elapsed_caption = nullptr)
+void add_quota_binding(const QuotaWindow *window, int window_minutes, lv_obj_t *countdown,
+                       lv_obj_t *elapsed_bar = nullptr, lv_obj_t *elapsed_caption = nullptr)
 {
     if (!window || quota_binding_count >= MAX_QUOTA_BINDINGS) return;
-    quota_bindings[quota_binding_count++] = {*window, window_minutes, accent, countdown, usage_bar,
-                                              elapsed_bar, elapsed_caption};
+    quota_bindings[quota_binding_count++] = {*window, window_minutes, countdown, elapsed_bar,
+                                              elapsed_caption};
 }
 
 void update_quota_bindings(int64_t now)
@@ -373,9 +359,6 @@ void update_quota_bindings(int64_t now)
         char text[BAR_PERCENT_TEXT_CAPACITY];
         snprintf(text, sizeof(text), "%d%%", value);
         lv_label_set_text(binding.elapsed_caption, text);
-        lv_obj_set_style_bg_color(binding.usage_bar,
-                                  lv_color_hex(risk_color(binding.accent, binding.window.used_percent, elapsed)),
-                                  LV_PART_INDICATOR);
     }
 }
 
@@ -407,12 +390,11 @@ void quota_block(lv_obj_t *parent, const QuotaWindow *window, const char *fallba
     lv_obj_set_style_text_letter_space(count, COUNTDOWN_LETTER_SPACE, 0);
     dashboard_label(parent, "TO RESET", QUOTA_RESET_CAPTION_X, y + QUOTA_RESET_CAPTION_Y_OFFSET,
                     QUOTA_RESET_CAPTION_WIDTH, &lv_font_montserrat_10, COLOR_SECONDARY);
-    lv_obj_t *usage_bar = dashboard_bar(parent, y + QUOTA_USAGE_BAR_Y_OFFSET, "USAGE", used,
-                                         risk_color(accent, used, elapsed));
+    dashboard_bar(parent, y + QUOTA_USAGE_BAR_Y_OFFSET, "USAGE", used, accent);
     lv_obj_t *elapsed_caption = nullptr;
     lv_obj_t *elapsed_bar = dashboard_bar(parent, y + QUOTA_ELAPSED_BAR_Y_OFFSET, "ELAPSED", elapsed,
                                            COLOR_TIME, &elapsed_caption);
-    add_quota_binding(window, effective_minutes, accent, count, usage_bar, elapsed_bar, elapsed_caption);
+    add_quota_binding(window, effective_minutes, count, elapsed_bar, elapsed_caption);
 }
 
 const char *error_message(ErrorCode error)
@@ -440,19 +422,12 @@ const char *error_message(ErrorCode error)
     return "Provider request failed";
 }
 
-void provider_marker(lv_obj_t *parent, uint32_t color)
+void provider_marker(lv_obj_t *parent, const lv_image_dsc_t *logo)
 {
-
-    lv_obj_t *glyph = lv_line_create(parent);
-    lv_obj_set_pos(glyph, PROVIDER_GLYPH_X, PROVIDER_GLYPH_Y);
-    lv_obj_set_size(glyph, PROVIDER_GLYPH_SIZE, PROVIDER_GLYPH_SIZE);
-    if (color == COLOR_CODEX) {
-        lv_line_set_points(glyph, CODEX_GLYPH, sizeof(CODEX_GLYPH) / sizeof(CODEX_GLYPH[0]));
-    } else {
-        lv_line_set_points(glyph, CLAUDE_GLYPH, sizeof(CLAUDE_GLYPH) / sizeof(CLAUDE_GLYPH[0]));
-    }
-    lv_obj_set_style_line_color(glyph, lv_color_hex(color), 0);
-    lv_obj_set_style_line_width(glyph, PROVIDER_GLYPH_LINE_WIDTH, 0);
+    lv_obj_t *image = lv_image_create(parent);
+    lv_image_set_src(image, logo);
+    lv_obj_set_pos(image, PROVIDER_LOGO_X, PROVIDER_LOGO_Y);
+    lv_obj_set_size(image, PROVIDER_LOGO_SIZE, PROVIDER_LOGO_SIZE);
 }
 
 void dashboard_footer(lv_obj_t *parent, const ProviderStatus &status)
@@ -474,7 +449,7 @@ void dashboard_footer(lv_obj_t *parent, const ProviderStatus &status)
 
 void render_codex_dashboard(lv_obj_t *tile, const ProviderStatus &status)
 {
-    provider_marker(tile, COLOR_CODEX);
+    provider_marker(tile, &CODEX_LOGO);
     const QuotaWindow *primary = find_quota_window(status, "Primary");
     const QuotaWindow *secondary = find_quota_window(status, "Secondary");
     const QuotaWindow *top = find_quota_window_by_duration(status, FIVE_HOUR_WINDOW_MINUTES);
@@ -500,7 +475,7 @@ void render_codex_dashboard(lv_obj_t *tile, const ProviderStatus &status)
 
 void render_claude_dashboard(lv_obj_t *tile, const ProviderStatus &status)
 {
-    provider_marker(tile, COLOR_CLAUDE);
+    provider_marker(tile, &CLAUDE_LOGO);
     quota_block(tile, find_quota_window(status, "5 hour"), "5H", CLAUDE_PRIMARY_Y,
                 FIVE_HOUR_WINDOW_MINUTES, COLOR_CLAUDE);
     divider(tile, CLAUDE_FIRST_DIVIDER_Y);
@@ -537,7 +512,7 @@ void render_claude_dashboard(lv_obj_t *tile, const ProviderStatus &status)
     lv_obj_set_style_text_letter_space(fable_reset, COUNTDOWN_LETTER_SPACE, 0);
     dashboard_label(tile, "TO RESET", FABLE_RESET_CAPTION_X, FABLE_RESET_CAPTION_Y,
                     FABLE_RESET_CAPTION_WIDTH, &lv_font_montserrat_10, COLOR_SECONDARY);
-    add_quota_binding(fable, SEVEN_DAY_WINDOW_MINUTES, COLOR_CLAUDE, fable_reset);
+    add_quota_binding(fable, SEVEN_DAY_WINDOW_MINUTES, fable_reset);
     divider(tile, FABLE_DIVIDER_Y);
 
     const ClaudeExtraUsage &extra = status.extra_usage;

@@ -13,6 +13,8 @@ idf_component_register(
         "portal/wifi_portal.cpp"
         "providers/claude_protocol.cpp"
         "providers/openai_protocol.cpp"
+        "ui/assets/claude_logo.c"
+        "ui/assets/codex_logo.c"
         "ui/ui.cpp"
         "ui/view_model.cpp"
         "util/base64url.cpp"
