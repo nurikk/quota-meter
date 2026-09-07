@@ -2,6 +2,8 @@
 #include "../util/base64url.h"
 #include "../domain/state_reducer.h"
 #include "cJSON.h"
+#include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +23,19 @@ static bool json_string(cJSON *root, const char *key, char *out, size_t cap, boo
 static cJSON *parse_bounded(const char *json, size_t length)
 {
     if (!json || length == 0 || length > 16384) return nullptr;
-    return cJSON_ParseWithLength(json, length);
+    const char *end = nullptr;
+    cJSON *root = cJSON_ParseWithLengthOpts(json, length, &end, false);
+    while (end && end < json + length && isspace(static_cast<unsigned char>(*end))) ++end;
+    if (!root || end != json + length) {
+        cJSON_Delete(root);
+        return nullptr;
+    }
+    return root;
+}
+
+static bool integer_in_range(double value, double minimum, double maximum)
+{
+    return isfinite(value) && value >= minimum && value <= maximum && floor(value) == value;
 }
 
 ErrorCode oauth_refresh_error(const HttpResult &response)
@@ -108,9 +122,21 @@ bool parse_openai_device_code(const char *json, size_t length, OpenAiDeviceCode 
     bool ok = json_string(root, "device_auth_id", out->device_auth_id, sizeof(out->device_auth_id));
     if (!json_string(root, "user_code", out->user_code, sizeof(out->user_code))) ok = json_string(root, "usercode", out->user_code, sizeof(out->user_code));
     cJSON *interval = cJSON_GetObjectItemCaseSensitive(root, "interval");
-    if (cJSON_IsNumber(interval)) out->interval = static_cast<uint32_t>(interval->valuedouble);
-    else if (cJSON_IsString(interval)) out->interval = static_cast<uint32_t>(strtoul(interval->valuestring, nullptr, 10));
-    if (out->interval < 1 || out->interval > 60) ok = false;
+    if (cJSON_IsNumber(interval) && integer_in_range(interval->valuedouble, 1, 60)) {
+        out->interval = static_cast<uint32_t>(interval->valuedouble);
+    } else if (cJSON_IsString(interval) && interval->valuestring) {
+        uint32_t parsed_interval = 0;
+        for (const unsigned char *cursor = reinterpret_cast<const unsigned char *>(interval->valuestring);
+             *cursor; ++cursor) {
+            if (!isdigit(*cursor) || parsed_interval > 6) {
+                parsed_interval = 0;
+                break;
+            }
+            parsed_interval = parsed_interval * 10 + (*cursor - '0');
+        }
+        if (parsed_interval >= 1 && parsed_interval <= 60) out->interval = parsed_interval;
+    }
+    if (out->interval == 0) ok = false;
     cJSON_Delete(root); return ok;
 }
 
@@ -124,7 +150,8 @@ bool parse_oauth_tokens(const char *json, size_t length, OAuthTokens *out, bool 
     bool has_refresh = json_string(root, "refresh_token", out->refresh_token, sizeof(out->refresh_token), false) && out->refresh_token[0];
     bool has_id = json_string(root, "id_token", out->id_token, sizeof(out->id_token), false) && out->id_token[0];
     cJSON *expires = cJSON_GetObjectItemCaseSensitive(root, "expires_in");
-    out->expires_in = cJSON_IsNumber(expires) && expires->valuedouble > 0 ? static_cast<uint32_t>(expires->valuedouble) : 3600;
+    out->expires_in = cJSON_IsNumber(expires) && integer_in_range(expires->valuedouble, 1, UINT32_MAX)
+        ? static_cast<uint32_t>(expires->valuedouble) : 3600;
     cJSON_Delete(root);
     return require_refresh ? has_access && has_refresh : has_access || has_refresh || has_id;
 }
@@ -151,7 +178,7 @@ bool openai_account_id_from_jwt(const char *jwt, char *out, size_t cap)
     size_t written = 0;
     bool decoded_ok = base64url_decode(encoded, decoded, 4096, &written);
     if (decoded_ok) decoded[written] = 0;
-    cJSON *root = decoded_ok ? cJSON_ParseWithLength(reinterpret_cast<char *>(decoded), written) : nullptr;
+    cJSON *root = decoded_ok ? parse_bounded(reinterpret_cast<char *>(decoded), written) : nullptr;
     cJSON *auth = root ? cJSON_GetObjectItemCaseSensitive(root, "https://api.openai.com/auth") : nullptr;
     bool ok = cJSON_IsObject(auth) && json_string(auth, "chatgpt_account_id", out, cap);
     cJSON_Delete(root);
@@ -169,20 +196,23 @@ static void add_window(ProviderStatus *status, const char *label, cJSON *window)
     if (!cJSON_IsObject(window) || status->window_count >= 8) return;
     cJSON *used = cJSON_GetObjectItemCaseSensitive(window, "used_percent");
     if (!cJSON_IsNumber(used)) used = cJSON_GetObjectItemCaseSensitive(window, "usedPercent");
-    if (!cJSON_IsNumber(used)) return;
+    if (!cJSON_IsNumber(used) || !isfinite(used->valuedouble)) return;
     QuotaWindow &target = status->windows[status->window_count++]; memset(&target, 0, sizeof(target));
     snprintf(target.label, sizeof(target.label), "%s", label); target.used_percent = static_cast<float>(used->valuedouble); target.present = true;
     cJSON *reset = cJSON_GetObjectItemCaseSensitive(window, "reset_at");
     if (!cJSON_IsNumber(reset)) reset = cJSON_GetObjectItemCaseSensitive(window, "resets_at");
     if (!cJSON_IsNumber(reset)) reset = cJSON_GetObjectItemCaseSensitive(window, "resetsAt");
-    if (cJSON_IsNumber(reset)) target.resets_at = static_cast<int64_t>(reset->valuedouble);
+    if (cJSON_IsNumber(reset) && integer_in_range(reset->valuedouble, 0, 253402300799.0)) {
+        target.resets_at = static_cast<int64_t>(reset->valuedouble);
+    }
     cJSON *minutes = cJSON_GetObjectItemCaseSensitive(window, "window_duration_mins");
     if (!cJSON_IsNumber(minutes)) minutes = cJSON_GetObjectItemCaseSensitive(window, "windowDurationMins");
-    if (cJSON_IsNumber(minutes) && minutes->valuedouble > 0) {
+    if (cJSON_IsNumber(minutes) && integer_in_range(minutes->valuedouble, 1, INT32_MAX)) {
         target.window_minutes = static_cast<int32_t>(minutes->valuedouble);
     } else {
         cJSON *seconds = cJSON_GetObjectItemCaseSensitive(window, "limit_window_seconds");
-        if (cJSON_IsNumber(seconds) && seconds->valuedouble > 0) {
+        if (cJSON_IsNumber(seconds) && integer_in_range(seconds->valuedouble, 60,
+                                                        static_cast<double>(INT32_MAX) * 60)) {
             target.window_minutes = static_cast<int32_t>(seconds->valuedouble / 60);
         }
     }
@@ -191,7 +221,9 @@ static void add_window(ProviderStatus *status, const char *label, cJSON *window)
 bool parse_openai_usage(const char *json, size_t length, ProviderStatus *status)
 {
     if (!status) return false; cJSON *root = parse_bounded(json, length); if (!root || !cJSON_IsObject(root)) { cJSON_Delete(root); return false; }
-    status->window_count = 0; cJSON *plan = cJSON_GetObjectItemCaseSensitive(root, "plan_type");
+    status->window_count = 0;
+    status->plan[0] = 0;
+    cJSON *plan = cJSON_GetObjectItemCaseSensitive(root, "plan_type");
     if (!cJSON_IsString(plan)) plan = cJSON_GetObjectItemCaseSensitive(root, "planType");
     if (cJSON_IsString(plan) && strlen(plan->valuestring) < sizeof(status->plan)) strcpy(status->plan, plan->valuestring);
     cJSON *rate = cJSON_GetObjectItemCaseSensitive(root, "rate_limit"); if (!cJSON_IsObject(rate)) rate = root;
@@ -204,9 +236,8 @@ bool parse_openai_usage(const char *json, size_t length, ProviderStatus *status)
     status->reset_credits = {};
     cJSON *credits = cJSON_GetObjectItemCaseSensitive(root, "rate_limit_reset_credits");
     cJSON *available = cJSON_GetObjectItemCaseSensitive(credits, "available_count");
-    if (cJSON_IsNumber(available) && available->valuedouble >= 0 && available->valuedouble <= UINT32_MAX) {
-        const uint32_t count = static_cast<uint32_t>(available->valuedouble);
-        if (available->valuedouble == count) status->reset_credits = {true, count};
+    if (cJSON_IsNumber(available) && integer_in_range(available->valuedouble, 0, UINT32_MAX)) {
+        status->reset_credits = {true, static_cast<uint32_t>(available->valuedouble)};
     }
     cJSON_Delete(root); return status->window_count > 0;
 }

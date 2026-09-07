@@ -43,7 +43,10 @@ extern "C" void app_main(void)
         abort();
     }
     ESP_ERROR_CHECK(bsp_display_brightness_set(55));
-    qm::ui_create();
+    if (!qm::ui_create()) {
+        ESP_LOGE("quota_meter", "Could not acquire display lock for UI initialization");
+        abort();
+    }
     start_task(qm::wifi_task, "wifi_owner", 6144, 5);
     start_task(qm::auth_worker_task, "cloud_owner", 32768, 4);
     start_task(qm::ui_task, "quota_ui", 16384, 3);

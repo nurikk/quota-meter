@@ -1,5 +1,5 @@
 #pragma once
 namespace qm {
-void ui_create();
+bool ui_create();
 void ui_task(void *argument);
 }

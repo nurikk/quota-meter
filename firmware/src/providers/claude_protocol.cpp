@@ -2,6 +2,7 @@
 #include "../auth/pkce.h"
 #include "cJSON.h"
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -29,8 +30,10 @@ static bool decode_component(const char *begin, size_t len, char *out, size_t ca
 {
     size_t used = 0; for (size_t i = 0; i < len; ++i) {
         unsigned char value = static_cast<unsigned char>(begin[i]);
-        if (value == '%' && i + 2 < len && isxdigit(begin[i + 1]) && isxdigit(begin[i + 2])) {
-            auto digit = [](char c) { return c <= '9' ? c - '0' : (tolower(c) - 'a' + 10); };
+        if (value == '%' && i + 2 < len &&
+            isxdigit(static_cast<unsigned char>(begin[i + 1])) &&
+            isxdigit(static_cast<unsigned char>(begin[i + 2]))) {
+            auto digit = [](unsigned char c) { return c <= '9' ? c - '0' : (tolower(c) - 'a' + 10); };
             value = static_cast<unsigned char>((digit(begin[i + 1]) << 4) | digit(begin[i + 2])); i += 2;
         } else if (value == '+') value = ' ';
         if (value < 0x20 || used + 1 >= cap) return false; out[used++] = static_cast<char>(value);
@@ -86,13 +89,42 @@ bool claude_exchange_request(const char *code, const char *state, const char *ve
 bool claude_refresh_request(const char *token, char *out, size_t cap)
 { return token_body("refresh_token", "refresh_token", token, nullptr, nullptr, out, cap); }
 
+static bool parse_digits(const char *value, size_t count, int *output)
+{
+    int parsed = 0;
+    for (size_t index = 0; index < count; ++index) {
+        const unsigned char character = static_cast<unsigned char>(value[index]);
+        if (!isdigit(character)) return false;
+        parsed = parsed * 10 + character - '0';
+    }
+    *output = parsed;
+    return true;
+}
+
+static bool leap_year(int year)
+{
+    return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+}
+
+static int days_in_month(int year, int month)
+{
+    static constexpr int DAYS[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    return month == 2 && leap_year(year) ? 29 : DAYS[month - 1];
+}
+
 static int64_t parse_utc_timestamp(const char *value)
 {
     if (!value) return 0;
+    const size_t length = strlen(value);
+    if (length < 20 || value[4] != '-' || value[7] != '-' || value[10] != 'T' ||
+        value[13] != ':' || value[16] != ':') return 0;
+
     int year, month, day, hour, minute, second;
-    if (sscanf(value, "%4d-%2d-%2dT%2d:%2d:%2d", &year, &month, &day, &hour, &minute, &second) != 6 ||
-        year < 1970 || year > 2100 || month < 1 || month > 12 || day < 1 || day > 31 ||
-        hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60) return 0;
+    if (!parse_digits(value, 4, &year) || !parse_digits(value + 5, 2, &month) ||
+        !parse_digits(value + 8, 2, &day) || !parse_digits(value + 11, 2, &hour) ||
+        !parse_digits(value + 14, 2, &minute) || !parse_digits(value + 17, 2, &second) ||
+        year < 1970 || year > 2100 || month < 1 || month > 12 ||
+        day < 1 || day > days_in_month(year, month) || hour > 23 || minute > 59 || second > 59) return 0;
 
     const char *suffix = value + 19;
     if (*suffix == '.') {
@@ -104,24 +136,42 @@ static int64_t parse_utc_timestamp(const char *value)
     int offset_seconds = 0;
     if (suffix[0] == 'Z' && suffix[1] == 0) {
         offset_seconds = 0;
-    } else if (suffix[0] == '+' || suffix[0] == '-') {
-        int offset_hours, offset_minutes, consumed = 0;
-        if (sscanf(suffix + 1, "%2d:%2d%n", &offset_hours, &offset_minutes, &consumed) != 2 ||
-            consumed != 5 || suffix[6] != 0 || offset_hours > 23 || offset_minutes > 59) return 0;
+    } else if ((suffix[0] == '+' || suffix[0] == '-') && strlen(suffix) == 6 && suffix[3] == ':') {
+        int offset_hours, offset_minutes;
+        if (!parse_digits(suffix + 1, 2, &offset_hours) ||
+            !parse_digits(suffix + 4, 2, &offset_minutes) ||
+            offset_hours > 23 || offset_minutes > 59) return 0;
         offset_seconds = (offset_hours * 60 + offset_minutes) * 60;
         if (suffix[0] == '-') offset_seconds = -offset_seconds;
     } else {
         return 0;
     }
 
-    int adjusted_year = year - (month <= 2);
-    int era = (adjusted_year >= 0 ? adjusted_year : adjusted_year - 399) / 400;
-    unsigned year_of_era = static_cast<unsigned>(adjusted_year - era * 400);
-    unsigned adjusted_month = static_cast<unsigned>(month + (month > 2 ? -3 : 9));
-    unsigned day_of_year = (153 * adjusted_month + 2) / 5 + static_cast<unsigned>(day) - 1;
-    unsigned day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    int64_t days = static_cast<int64_t>(era) * 146097 + day_of_era - 719468;
+    const int adjusted_year = year - (month <= 2);
+    const int era = (adjusted_year >= 0 ? adjusted_year : adjusted_year - 399) / 400;
+    const unsigned year_of_era = static_cast<unsigned>(adjusted_year - era * 400);
+    const unsigned adjusted_month = static_cast<unsigned>(month + (month > 2 ? -3 : 9));
+    const unsigned day_of_year = (153 * adjusted_month + 2) / 5 + static_cast<unsigned>(day) - 1;
+    const unsigned day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    const int64_t days = static_cast<int64_t>(era) * 146097 + day_of_era - 719468;
     return days * 86400 + hour * 3600 + minute * 60 + second - offset_seconds;
+}
+
+static bool finite_integer(double value, double minimum, double maximum)
+{
+    return isfinite(value) && value >= minimum && value <= maximum && floor(value) == value;
+}
+
+static cJSON *parse_bounded(const char *json, size_t length)
+{
+    const char *end = nullptr;
+    cJSON *root = cJSON_ParseWithLengthOpts(json, length, &end, false);
+    while (end && end < json + length && isspace(static_cast<unsigned char>(*end))) ++end;
+    if (!root || end != json + length) {
+        cJSON_Delete(root);
+        return nullptr;
+    }
+    return root;
 }
 
 static void add_usage(ProviderStatus *status, const char *label, cJSON *window, bool model_limit = false,
@@ -130,7 +180,7 @@ static void add_usage(ProviderStatus *status, const char *label, cJSON *window, 
     if (!cJSON_IsObject(window) || status->window_count >= 8) return;
     cJSON *used = cJSON_GetObjectItemCaseSensitive(window, "utilization");
     if (!cJSON_IsNumber(used)) used = cJSON_GetObjectItemCaseSensitive(window, "percent");
-    if (!cJSON_IsNumber(used)) return;
+    if (!cJSON_IsNumber(used) || !isfinite(used->valuedouble)) return;
     QuotaWindow &target = status->windows[status->window_count++];
     target = {};
     snprintf(target.label, sizeof(target.label), "%s", label);
@@ -140,7 +190,10 @@ static void add_usage(ProviderStatus *status, const char *label, cJSON *window, 
     target.window_minutes = window_minutes;
     cJSON *reset = cJSON_GetObjectItemCaseSensitive(window, "resets_at");
     if (cJSON_IsString(reset)) target.resets_at = parse_utc_timestamp(reset->valuestring);
-    else if (cJSON_IsNumber(reset)) target.resets_at = static_cast<int64_t>(reset->valuedouble);
+    else if (cJSON_IsNumber(reset) &&
+             finite_integer(reset->valuedouble, 0, 253402300799.0)) {
+        target.resets_at = static_cast<int64_t>(reset->valuedouble);
+    }
 }
 
 static const char *model_name(cJSON *model)
@@ -179,7 +232,8 @@ static bool parse_money(cJSON *object, double *amount, uint8_t *exponent, char *
     if (!cJSON_IsObject(object)) return false;
     cJSON *minor = cJSON_GetObjectItemCaseSensitive(object, "amount_minor");
     cJSON *power = cJSON_GetObjectItemCaseSensitive(object, "exponent");
-    if (!cJSON_IsNumber(minor) || !cJSON_IsNumber(power) || power->valuedouble < 0 || power->valuedouble > 6) return false;
+    if (!cJSON_IsNumber(minor) || !isfinite(minor->valuedouble) || !cJSON_IsNumber(power) ||
+        !finite_integer(power->valuedouble, 0, 6)) return false;
     *exponent = static_cast<uint8_t>(power->valuedouble);
     *amount = decimal_amount(minor->valuedouble, *exponent);
     cJSON *code = cJSON_GetObjectItemCaseSensitive(object, "currency");
@@ -196,17 +250,17 @@ static void parse_extra_usage(cJSON *root, ClaudeExtraUsage *extra)
         cJSON *enabled = cJSON_GetObjectItemCaseSensitive(object, "is_enabled");
         extra->is_enabled = cJSON_IsTrue(enabled);
         cJSON *value = cJSON_GetObjectItemCaseSensitive(object, "utilization");
-        if (cJSON_IsNumber(value)) { extra->has_utilization = true; extra->utilization = static_cast<float>(value->valuedouble); }
+        if (cJSON_IsNumber(value) && isfinite(value->valuedouble)) { extra->has_utilization = true; extra->utilization = static_cast<float>(value->valuedouble); }
         value = cJSON_GetObjectItemCaseSensitive(object, "decimal_places");
-        if (cJSON_IsNumber(value) && value->valuedouble >= 0 && value->valuedouble <= 6) extra->decimal_places = static_cast<uint8_t>(value->valuedouble);
+        if (cJSON_IsNumber(value) && finite_integer(value->valuedouble, 0, 6)) extra->decimal_places = static_cast<uint8_t>(value->valuedouble);
         value = cJSON_GetObjectItemCaseSensitive(object, "used_credits");
-        if (cJSON_IsNumber(value)) {
+        if (cJSON_IsNumber(value) && isfinite(value->valuedouble)) {
             extra->has_used_credits = true;
             extra->used_credits = decimal_amount(value->valuedouble, extra->decimal_places);
             extra->spend_decimal_places = extra->decimal_places;
         }
         value = cJSON_GetObjectItemCaseSensitive(object, "monthly_limit");
-        if (cJSON_IsNumber(value)) {
+        if (cJSON_IsNumber(value) && isfinite(value->valuedouble)) {
             extra->has_monthly_limit = true;
             extra->monthly_limit = decimal_amount(value->valuedouble, extra->decimal_places);
             extra->limit_decimal_places = extra->decimal_places;
@@ -219,7 +273,7 @@ static void parse_extra_usage(cJSON *root, ClaudeExtraUsage *extra)
     if (!cJSON_IsObject(spend)) return;
     extra->present = true;
     cJSON *percent = cJSON_GetObjectItemCaseSensitive(spend, "percent");
-    if (cJSON_IsNumber(percent)) {
+    if (cJSON_IsNumber(percent) && isfinite(percent->valuedouble)) {
         extra->has_spend_percent = true;
         extra->spend_percent = static_cast<float>(percent->valuedouble);
     }
@@ -239,7 +293,7 @@ static void parse_extra_usage(cJSON *root, ClaudeExtraUsage *extra)
 bool parse_claude_usage(const char *json, size_t length, ProviderStatus *status)
 {
     if (!json || !status || length == 0 || length > 16384) return false;
-    cJSON *root = cJSON_ParseWithLength(json, length);
+    cJSON *root = parse_bounded(json, length);
     if (!cJSON_IsObject(root)) { cJSON_Delete(root); return false; }
     status->window_count = 0;
     parse_extra_usage(root, &status->extra_usage);

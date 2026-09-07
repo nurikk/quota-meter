@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include "auth/pkce.h"
 #include "domain/state_reducer.h"
+#include "net/http_client.h"
 #include "portal/portal_logic.h"
 #include "providers/claude_protocol.h"
 #include "providers/openai_protocol.h"
@@ -71,6 +72,65 @@ static void test_oauth_and_usage_parsing()
     TEST_ASSERT_EQUAL_INT32(300, status.windows[0].window_minutes);
     TEST_ASSERT_FALSE(parse_claude_usage("[]", 2, &status));
 }
+static void test_strict_provider_parsing()
+{
+    OpenAiDeviceCode device{};
+    const char *fractional_interval =
+        "{\"device_auth_id\":\"dev\",\"user_code\":\"ABCD\",\"interval\":1.5}";
+    TEST_ASSERT_FALSE(parse_openai_device_code(fractional_interval, strlen(fractional_interval), &device));
+
+    ProviderStatus status{};
+    strcpy(status.plan, "stale-plan");
+    const char *without_plan =
+        "{\"rate_limit\":{\"primary_window\":{\"used_percent\":5,\"reset_at\":100}}}";
+    TEST_ASSERT_TRUE(parse_openai_usage(without_plan, strlen(without_plan), &status));
+    TEST_ASSERT_EQUAL_STRING("", status.plan);
+    const char *openai_trailing =
+        "{\"rate_limit\":{\"primary_window\":{\"used_percent\":5}}}garbage";
+    TEST_ASSERT_FALSE(parse_openai_usage(openai_trailing, strlen(openai_trailing), &status));
+
+    const char *valid_leap =
+        "{\"five_hour\":{\"utilization\":1,\"resets_at\":\"2028-02-29T12:34:56Z\"}}";
+    TEST_ASSERT_TRUE(parse_claude_usage(valid_leap, strlen(valid_leap), &status));
+    TEST_ASSERT_GREATER_THAN_INT64(0, status.windows[0].resets_at);
+    const char *invalid_day =
+        "{\"five_hour\":{\"utilization\":1,\"resets_at\":\"2027-02-29T12:34:56Z\"}}";
+    TEST_ASSERT_TRUE(parse_claude_usage(invalid_day, strlen(invalid_day), &status));
+    TEST_ASSERT_EQUAL_INT64(0, status.windows[0].resets_at);
+    const char *short_fields =
+        "{\"five_hour\":{\"utilization\":1,\"resets_at\":\"2030-1-1T1:1:1Z\"}}";
+    TEST_ASSERT_TRUE(parse_claude_usage(short_fields, strlen(short_fields), &status));
+    TEST_ASSERT_EQUAL_INT64(0, status.windows[0].resets_at);
+    const char *claude_trailing =
+        "{\"five_hour\":{\"utilization\":1}} trailing";
+    TEST_ASSERT_FALSE(parse_claude_usage(claude_trailing, strlen(claude_trailing), &status));
+}
+
+static void test_retry_after_parsing()
+{
+    uint32_t delay = 0;
+    TEST_ASSERT_TRUE(parse_retry_after("120", 0, &delay));
+    TEST_ASSERT_EQUAL_UINT32(120, delay);
+    TEST_ASSERT_TRUE(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", 784111700, &delay));
+    TEST_ASSERT_EQUAL_UINT32(77, delay);
+    TEST_ASSERT_TRUE(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", 784111800, &delay));
+    TEST_ASSERT_EQUAL_UINT32(0, delay);
+    TEST_ASSERT_FALSE(parse_retry_after("120 seconds", 0, &delay));
+    TEST_ASSERT_FALSE(parse_retry_after("4294967296", 0, &delay));
+    TEST_ASSERT_FALSE(parse_retry_after("Sun, 31 Feb 2027 08:49:37 GMT", 0, &delay));
+}
+
+static void test_cached_usage_classification()
+{
+    ProviderStatus status{};
+    TEST_ASSERT_FALSE(has_cached_usage(status));
+    status.extra_usage.present = true;
+    TEST_ASSERT_TRUE(has_cached_usage(status));
+    status.auth = AuthState::Refreshing;
+    apply_credential_failure(status, ErrorCode::Network);
+    TEST_ASSERT_EQUAL(QuotaState::Stale, status.quota);
+}
+
 static void test_claude_extended_usage_parsing()
 {
     const char *json = "{\"five_hour\":{\"utilization\":12.5,\"resets_at\":\"2026-07-10T12:00:00Z\"},"
@@ -415,6 +475,9 @@ int main(int, char **)
     RUN_TEST(test_claude_authorize_contract);
     RUN_TEST(test_openai_request_and_response_contract);
     RUN_TEST(test_oauth_and_usage_parsing);
+    RUN_TEST(test_strict_provider_parsing);
+    RUN_TEST(test_retry_after_parsing);
+    RUN_TEST(test_cached_usage_classification);
     RUN_TEST(test_openai_reset_credits_parsing);
     RUN_TEST(test_format_codex_reset_credits);
     RUN_TEST(test_claude_extended_usage_parsing);

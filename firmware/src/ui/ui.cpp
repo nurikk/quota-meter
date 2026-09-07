@@ -273,8 +273,9 @@ void logout_provider(lv_event_t *event)
 
 void reset_wifi(lv_event_t *)
 {
-    clear_wifi_credentials();
-    esp_restart();
+    if (clear_wifi_credentials()) {
+        esp_restart();
+    }
 }
 
 void render_page_number(lv_obj_t *parent, size_t index, size_t count)
@@ -596,6 +597,9 @@ void render_add_option(lv_obj_t *parent, const char *name, const char *descripti
     if (status.auth == AuthState::Starting || status.auth == AuthState::Exchanging) {
         label(card, "Starting login...", &lv_font_montserrat_14, COLOR_SECONDARY);
     } else {
+        if (status.auth == AuthState::Error) {
+            label(card, error_message(status.error), &lv_font_montserrat_12, COLOR_HIGH);
+        }
         button(card, "Login", start_provider, reinterpret_cast<void *>(static_cast<uintptr_t>(provider)));
     }
 }
@@ -769,9 +773,9 @@ void render(const AppSnapshot &snapshot)
 
 } // namespace
 
-void ui_create()
+bool ui_create()
 {
-    if (!bsp_display_lock(UI_CREATE_LOCK_TIMEOUT_MS)) return;
+    if (!bsp_display_lock(UI_CREATE_LOCK_TIMEOUT_MS)) return false;
     root = lv_screen_active();
     lv_obj_set_scrollbar_mode(root, LV_SCROLLBAR_MODE_OFF);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
@@ -781,6 +785,7 @@ void ui_create()
     lv_obj_set_style_text_color(root, lv_color_hex(COLOR_PRIMARY), 0);
     render(app_state_get());
     bsp_display_unlock();
+    return true;
 }
 
 void ui_task(void *)

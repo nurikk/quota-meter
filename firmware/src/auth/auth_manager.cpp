@@ -15,6 +15,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include <atomic>
+#include <ctype.h>
 #include <initializer_list>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,7 +32,14 @@ static const char *provider_name(Provider provider)
 }
 
 enum class CommandType : uint8_t { Start, Callback, Refresh, Logout };
-struct Command { CommandType type; Provider provider; char callback[2049]; };
+struct Command { CommandType type; Provider provider; char *callback; };
+
+struct OpenAiPoll {
+    OpenAiDeviceCode device;
+    int64_t next_poll_at;
+    int64_t deadline;
+    bool active;
+};
 
 static QueueHandle_t queue_handle;
 static std::atomic_bool cancelled[2];
@@ -42,6 +50,7 @@ static char claude_state[129]{};
 static char claude_verifier[129]{};
 static int64_t claude_pending_until;
 static int64_t next_auto_refresh[2]{};
+static OpenAiPoll openai_poll{};
 static HttpResult *http_result;
 static OAuthTokens *parsed_tokens;
 static TokenBundle *next_bundle;
@@ -85,7 +94,7 @@ static void publish_error(Provider provider, ErrorCode error)
     status.auth = credentials_rejected[index(provider)] ? AuthState::Expired
         : have_bundle[index(provider)] ? AuthState::Authenticated : AuthState::Error;
     status.error = error;
-    status.quota = quota_after_failure(status.window_count > 0);
+    status.quota = quota_after_failure(has_cached_usage(status));
     app_state_set_provider(provider, status);
 }
 
@@ -234,7 +243,7 @@ static void fetch_quota(Provider provider)
     secure_clear(http_result, sizeof(*http_result));
     if (!parsed) {
         status.error = ErrorCode::InvalidResponse;
-        status.quota = quota_after_failure(status.window_count > 0);
+        status.quota = quota_after_failure(has_cached_usage(status));
         ESP_LOGW(TAG, "%s quota response could not be parsed", provider_name(provider));
     } else {
         status = parsed_status;
@@ -252,9 +261,27 @@ static void fetch_quota(Provider provider)
     app_state_set_provider(provider, status);
 }
 
+static void clear_openai_poll()
+{
+    secure_clear(&openai_poll, sizeof(openai_poll));
+}
+
+static cJSON *parse_complete_json(const char *json, size_t length)
+{
+    const char *end = nullptr;
+    cJSON *root = cJSON_ParseWithLengthOpts(json, length, &end, false);
+    while (end && end < json + length && isspace(static_cast<unsigned char>(*end))) ++end;
+    if (!root || end != json + length) {
+        cJSON_Delete(root);
+        return nullptr;
+    }
+    return root;
+}
+
 static void start_openai()
 {
     cancelled[0] = false;
+    clear_openai_poll();
     ProviderStatus status{};
     status.auth = AuthState::Starting;
     app_state_set_provider(Provider::OpenAI, status);
@@ -266,13 +293,13 @@ static void start_openai()
     post_json("https://auth.openai.com/api/accounts/deviceauth/usercode", body);
     secure_clear(body, sizeof(body));
     if (http_result->status != 200 || http_result->error != ErrorCode::None) {
-        ErrorCode error = http_result->error;
+        const ErrorCode error = http_result->error;
         secure_clear(http_result, sizeof(*http_result));
         publish_error(Provider::OpenAI, error);
         return;
     }
     OpenAiDeviceCode device{};
-    bool parsed = parse_openai_device_code(http_result->body, http_result->body_len, &device);
+    const bool parsed = parse_openai_device_code(http_result->body, http_result->body_len, &device);
     secure_clear(http_result, sizeof(*http_result));
     if (!parsed) {
         publish_error(Provider::OpenAI, ErrorCode::InvalidResponse);
@@ -282,81 +309,133 @@ static void start_openai()
     snprintf(status.login_url, sizeof(status.login_url), "%s", OPENAI_DEVICE_URL);
     snprintf(status.user_code, sizeof(status.user_code), "%s", device.user_code);
     app_state_set_provider(Provider::OpenAI, status);
-    int64_t deadline = time(nullptr) + 900;
-    while (time(nullptr) < deadline && !cancelled[0]) {
-        vTaskDelay(pdMS_TO_TICKS(device.interval * 1000));
-        char poll_body[512];
-        if (!openai_poll_request(device, poll_body, sizeof(poll_body))) break;
-        post_json("https://auth.openai.com/api/accounts/deviceauth/token", poll_body);
-        secure_clear(poll_body, sizeof(poll_body));
-        if (http_result->status == 403 || http_result->status == 404) {
-            secure_clear(http_result, sizeof(*http_result));
-            continue;
-        }
-        if (http_result->status != 200 || http_result->error != ErrorCode::None) {
-            ErrorCode error = http_result->error;
-            secure_clear(http_result, sizeof(*http_result));
-            publish_error(Provider::OpenAI, error);
-            return;
-        }
-        cJSON *root = cJSON_ParseWithLength(http_result->body, http_result->body_len);
-        cJSON *code = cJSON_GetObjectItemCaseSensitive(root, "authorization_code");
-        cJSON *challenge = cJSON_GetObjectItemCaseSensitive(root, "code_challenge");
-        cJSON *verifier = cJSON_GetObjectItemCaseSensitive(root, "code_verifier");
-        if (!cJSON_IsString(code) || !cJSON_IsString(challenge) || !cJSON_IsString(verifier) ||
-            strlen(code->valuestring) > 4096 || strlen(verifier->valuestring) > 128) {
-            cJSON_Delete(root);
-            secure_clear(http_result, sizeof(*http_result));
-            publish_error(Provider::OpenAI, ErrorCode::InvalidResponse);
-            return;
-        }
-        char exchange[4600];
-        bool built = openai_exchange_request(code->valuestring, verifier->valuestring, exchange, sizeof(exchange));
-        cJSON_Delete(root);
-        secure_clear(http_result, sizeof(*http_result));
-        if (!built) {
-            publish_error(Provider::OpenAI, ErrorCode::InvalidResponse);
-            return;
-        }
-        https_request({HttpMethod::Post, "https://auth.openai.com/oauth/token", exchange,
-                       "application/x-www-form-urlencoded", nullptr, nullptr, nullptr, 16384}, http_result);
-        secure_clear(exchange, sizeof(exchange));
-        if (http_result->status != 200 || http_result->error != ErrorCode::None) {
-            ErrorCode error = http_result->error;
-            secure_clear(http_result, sizeof(*http_result));
-            publish_error(Provider::OpenAI, error);
-            return;
-        }
-        secure_clear(parsed_tokens, sizeof(*parsed_tokens));
-        parsed = parse_oauth_tokens(http_result->body, http_result->body_len, parsed_tokens, true);
-        secure_clear(http_result, sizeof(*http_result));
-        if (!parsed) {
-            publish_error(Provider::OpenAI, ErrorCode::InvalidResponse);
-            return;
-        }
-        bool saved = store_tokens(Provider::OpenAI, *parsed_tokens);
-        secure_clear(parsed_tokens, sizeof(*parsed_tokens));
-        if (!saved) return;
-        status.auth = AuthState::Authenticated;
-        status.error = ErrorCode::None;
-        app_state_set_provider(Provider::OpenAI, status);
-        fetch_quota(Provider::OpenAI);
+    openai_poll.device = device;
+    openai_poll.next_poll_at = time(nullptr) + device.interval;
+    openai_poll.deadline = time(nullptr) + 900;
+    openai_poll.active = true;
+}
+
+static void service_openai_poll()
+{
+    if (!openai_poll.active) return;
+    const int64_t now = time(nullptr);
+    if (cancelled[0]) {
+        clear_openai_poll();
         return;
     }
-    publish_error(Provider::OpenAI, cancelled[0] ? ErrorCode::None : ErrorCode::Timeout);
+    if (now >= openai_poll.deadline) {
+        clear_openai_poll();
+        publish_error(Provider::OpenAI, ErrorCode::Timeout);
+        return;
+    }
+    if (now < openai_poll.next_poll_at || app_state_get().wifi != WifiState::Connected) return;
+    openai_poll.next_poll_at = now + openai_poll.device.interval;
+    if (cancelled[0]) {
+        clear_openai_poll();
+        return;
+    }
+
+    char poll_body[512];
+    if (!openai_poll_request(openai_poll.device, poll_body, sizeof(poll_body))) {
+        clear_openai_poll();
+        publish_error(Provider::OpenAI, ErrorCode::InvalidResponse);
+        return;
+    }
+    post_json("https://auth.openai.com/api/accounts/deviceauth/token", poll_body);
+    secure_clear(poll_body, sizeof(poll_body));
+    if (cancelled[0]) {
+        secure_clear(http_result, sizeof(*http_result));
+        clear_openai_poll();
+        return;
+    }
+    if (http_result->status == 403 || http_result->status == 404) {
+        secure_clear(http_result, sizeof(*http_result));
+        return;
+    }
+    if (http_result->status != 200 || http_result->error != ErrorCode::None) {
+        const ErrorCode error = http_result->error;
+        secure_clear(http_result, sizeof(*http_result));
+        clear_openai_poll();
+        publish_error(Provider::OpenAI, error);
+        return;
+    }
+
+    cJSON *root = parse_complete_json(http_result->body, http_result->body_len);
+    cJSON *code = cJSON_GetObjectItemCaseSensitive(root, "authorization_code");
+    cJSON *challenge = cJSON_GetObjectItemCaseSensitive(root, "code_challenge");
+    cJSON *verifier = cJSON_GetObjectItemCaseSensitive(root, "code_verifier");
+    if (!cJSON_IsString(code) || !cJSON_IsString(challenge) || !cJSON_IsString(verifier) ||
+        !code->valuestring || !verifier->valuestring || strlen(code->valuestring) > 4096 ||
+        strlen(verifier->valuestring) > 128) {
+        cJSON_Delete(root);
+        secure_clear(http_result, sizeof(*http_result));
+        clear_openai_poll();
+        publish_error(Provider::OpenAI, ErrorCode::InvalidResponse);
+        return;
+    }
+    char exchange[4600];
+    const bool built = openai_exchange_request(code->valuestring, verifier->valuestring,
+                                               exchange, sizeof(exchange));
+    cJSON_Delete(root);
+    secure_clear(http_result, sizeof(*http_result));
+    if (!built) {
+        clear_openai_poll();
+        publish_error(Provider::OpenAI, ErrorCode::InvalidResponse);
+        return;
+    }
+    https_request({HttpMethod::Post, "https://auth.openai.com/oauth/token", exchange,
+                   "application/x-www-form-urlencoded", nullptr, nullptr, nullptr, 16384}, http_result);
+    secure_clear(exchange, sizeof(exchange));
+    if (cancelled[0]) {
+        secure_clear(http_result, sizeof(*http_result));
+        clear_openai_poll();
+        return;
+    }
+    if (http_result->status != 200 || http_result->error != ErrorCode::None) {
+        const ErrorCode error = http_result->error;
+        secure_clear(http_result, sizeof(*http_result));
+        clear_openai_poll();
+        publish_error(Provider::OpenAI, error);
+        return;
+    }
+    secure_clear(parsed_tokens, sizeof(*parsed_tokens));
+    const bool parsed = parse_oauth_tokens(http_result->body, http_result->body_len, parsed_tokens, true);
+    secure_clear(http_result, sizeof(*http_result));
+    if (!parsed) {
+        secure_clear(parsed_tokens, sizeof(*parsed_tokens));
+        clear_openai_poll();
+        publish_error(Provider::OpenAI, ErrorCode::InvalidResponse);
+        return;
+    }
+    const bool saved = store_tokens(Provider::OpenAI, *parsed_tokens);
+    secure_clear(parsed_tokens, sizeof(*parsed_tokens));
+    clear_openai_poll();
+    if (!saved) return;
+    ProviderStatus status = app_state_get().openai;
+    status.auth = AuthState::Authenticated;
+    status.error = ErrorCode::None;
+    app_state_set_provider(Provider::OpenAI, status);
+    fetch_quota(Provider::OpenAI);
+}
+
+static void clear_claude_pending()
+{
+    secure_clear(claude_verifier, sizeof(claude_verifier));
+    secure_clear(claude_state, sizeof(claude_state));
+    claude_pending_until = 0;
 }
 
 static void start_claude()
 {
     cancelled[1] = false;
+    clear_claude_pending();
     ProviderStatus status{};
     status.auth = AuthState::Starting;
     app_state_set_provider(Provider::Claude, status);
     char challenge[64];
     if (!pkce_generate(claude_verifier, sizeof(claude_verifier), claude_state, sizeof(claude_state), challenge, sizeof(challenge)) ||
         !claude_authorize_url(challenge, claude_state, status.login_url, sizeof(status.login_url))) {
-        secure_clear(claude_verifier, sizeof(claude_verifier));
-        secure_clear(claude_state, sizeof(claude_state));
+        clear_claude_pending();
         publish_error(Provider::Claude, ErrorCode::InvalidResponse);
         return;
     }
@@ -367,7 +446,8 @@ static void start_claude()
 
 static void claude_callback(const char *callback)
 {
-    if (time(nullptr) > claude_pending_until || cancelled[1]) {
+    if (claude_pending_until == 0 || time(nullptr) > claude_pending_until || cancelled[1]) {
+        clear_claude_pending();
         publish_error(Provider::Claude, ErrorCode::Timeout);
         return;
     }
@@ -382,8 +462,7 @@ static void claude_callback(const char *callback)
     char body[5000];
     bool built = claude_exchange_request(code, claude_state, claude_verifier, body, sizeof(body));
     secure_clear(code, sizeof(code));
-    secure_clear(claude_verifier, sizeof(claude_verifier));
-    secure_clear(claude_state, sizeof(claude_state));
+    clear_claude_pending();
     if (!built) {
         publish_error(Provider::Claude, ErrorCode::InvalidResponse);
         return;
@@ -437,13 +516,18 @@ bool auth_enqueue_start(Provider provider)
 bool auth_enqueue_callback(const char *callback)
 {
     if (!callback || strlen(callback) > 2048) return false;
+    const size_t length = strlen(callback);
+    char *copy = static_cast<char *>(heap_caps_malloc(length + 1, MALLOC_CAP_8BIT));
+    if (!copy) return false;
+    memcpy(copy, callback, length + 1);
     Command command{};
     command.type = CommandType::Callback;
     command.provider = Provider::Claude;
-    snprintf(command.callback, sizeof(command.callback), "%s", callback);
-    bool ok = enqueue(command);
-    secure_clear(command.callback, sizeof(command.callback));
-    return ok;
+    command.callback = copy;
+    if (enqueue(command)) return true;
+    secure_clear(copy, length + 1);
+    free(copy);
+    return false;
 }
 
 bool auth_enqueue_refresh(Provider provider)
@@ -456,24 +540,29 @@ bool auth_enqueue_refresh(Provider provider)
 
 bool auth_enqueue_logout(Provider provider)
 {
-    cancelled[index(provider)] = true;
+    const size_t provider_index = index(provider);
+    const bool was_cancelled = cancelled[provider_index].exchange(true);
     Command command{};
     command.type = CommandType::Logout;
     command.provider = provider;
-    return enqueue(command);
+    if (enqueue(command)) return true;
+    cancelled[provider_index] = was_cancelled;
+    return false;
 }
 
 void auth_worker_task(void *)
 {
     for (Provider provider : {Provider::OpenAI, Provider::Claude}) {
-        size_t i = index(provider);
-        if (token_store_load(provider, &bundles[i]) == ESP_OK) {
-            if (provider == Provider::OpenAI && !bundles[i].account_id[0]) {
-                token_store_remove(provider);
-                secure_clear(&bundles[i], sizeof(bundles[i]));
+        const size_t provider_index = index(provider);
+        if (token_store_load(provider, &bundles[provider_index]) == ESP_OK) {
+            if (provider == Provider::OpenAI && !bundles[provider_index].account_id[0]) {
+                if (token_store_remove(provider) != ESP_OK) {
+                    ESP_LOGE(TAG, "%s invalid credentials could not be removed", provider_name(provider));
+                }
+                secure_clear(&bundles[provider_index], sizeof(bundles[provider_index]));
                 continue;
             }
-            have_bundle[i] = true;
+            have_bundle[provider_index] = true;
             ProviderStatus status{};
             if (quota_store_load(provider, &status) == ESP_OK) status.quota = QuotaState::Stale;
             status.auth = AuthState::Authenticated;
@@ -483,48 +572,80 @@ void auth_worker_task(void *)
                      static_cast<long long>(status.fetched_at));
         }
     }
+
     int64_t last_wall_time = 0;
     while (true) {
         Command command{};
-        if (xQueueReceive(queue_handle, &command, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        if (xQueueReceive(queue_handle, &command, pdMS_TO_TICKS(500)) == pdTRUE) {
             if (command.type == CommandType::Logout) {
-                size_t i = index(command.provider);
-                token_store_remove(command.provider);
-                secure_clear(&bundles[i], sizeof(bundles[i]));
-                have_bundle[i] = false;
-                credentials_rejected[i] = false;
-                next_auto_refresh[i] = 0;
-                ProviderStatus status{};
-                status.auth = AuthState::SignedOut;
-                app_state_set_provider(command.provider, status);
-                continue;
+                const size_t provider_index = index(command.provider);
+                if (command.provider == Provider::OpenAI) clear_openai_poll();
+                else clear_claude_pending();
+                const esp_err_t removed = token_store_remove(command.provider);
+                if (removed == ESP_OK) {
+                    secure_clear(&bundles[provider_index], sizeof(bundles[provider_index]));
+                    have_bundle[provider_index] = false;
+                    credentials_rejected[provider_index] = false;
+                    next_auto_refresh[provider_index] = 0;
+                    ProviderStatus status{};
+                    status.auth = AuthState::SignedOut;
+                    app_state_set_provider(command.provider, status);
+                } else {
+                    cancelled[provider_index] = false;
+                    AppSnapshot snapshot = app_state_get();
+                    ProviderStatus status = command.provider == Provider::OpenAI
+                        ? snapshot.openai : snapshot.claude;
+                    status.auth = credentials_rejected[provider_index] ? AuthState::Expired
+                        : have_bundle[provider_index] ? AuthState::Authenticated : AuthState::Error;
+                    status.error = ErrorCode::Storage;
+                    status.quota = quota_after_failure(has_cached_usage(status));
+                    app_state_set_provider(command.provider, status);
+                    ESP_LOGE(TAG, "%s credentials could not be removed error=%d",
+                             provider_name(command.provider), removed);
+                }
+            } else if (command.type != CommandType::Refresh ||
+                       !credentials_rejected[index(command.provider)]) {
+                if (app_state_get().wifi != WifiState::Connected || time_sync_start_and_wait() != ESP_OK) {
+                    publish_error(command.provider, ErrorCode::Network);
+                } else if (command.type == CommandType::Start) {
+                    command.provider == Provider::OpenAI ? start_openai() : start_claude();
+                } else if (command.type == CommandType::Callback) {
+                    claude_callback(command.callback);
+                } else if (command.type == CommandType::Refresh) {
+                    fetch_quota(command.provider);
+                }
             }
-            if (command.type == CommandType::Refresh && credentials_rejected[index(command.provider)]) continue;
-            if (app_state_get().wifi != WifiState::Connected || time_sync_start_and_wait() != ESP_OK) {
-                publish_error(command.provider, ErrorCode::Network);
-                secure_clear(command.callback, sizeof(command.callback));
-                continue;
+            if (command.callback) {
+                secure_clear(command.callback, strlen(command.callback) + 1);
+                free(command.callback);
             }
-            if (command.type == CommandType::Start) {
-                command.provider == Provider::OpenAI ? start_openai() : start_claude();
-            } else if (command.type == CommandType::Callback) {
-                claude_callback(command.callback);
-                secure_clear(command.callback, sizeof(command.callback));
-            } else if (command.type == CommandType::Refresh) {
-                fetch_quota(command.provider);
+        }
+
+        const int64_t now = time(nullptr);
+        if (time_is_plausible()) {
+            if (claude_pending_until > 0 && now > claude_pending_until) {
+                clear_claude_pending();
+                publish_error(Provider::Claude, ErrorCode::Timeout);
             }
-        } else if (app_state_get().wifi == WifiState::Connected && time_sync_start_and_wait() == ESP_OK) {
-            int64_t now = time(nullptr);
-            if (last_wall_time > 0 && now < last_wall_time) {
-                ESP_LOGW(TAG, "Wall clock moved backward from %lld to %lld; resetting refresh schedule",
-                         static_cast<long long>(last_wall_time), static_cast<long long>(now));
-                next_auto_refresh[0] = 0;
-                next_auto_refresh[1] = 0;
+            if (openai_poll.active && now >= openai_poll.deadline) {
+                clear_openai_poll();
+                publish_error(Provider::OpenAI, ErrorCode::Timeout);
             }
-            last_wall_time = now;
-            Provider provider = (now / 60) % 2 == 0 ? Provider::OpenAI : Provider::Claude;
-            size_t i = index(provider);
-            if (have_bundle[i] && !credentials_rejected[i] && now >= next_auto_refresh[i]) fetch_quota(provider);
+        }
+        if (app_state_get().wifi != WifiState::Connected || time_sync_start_and_wait() != ESP_OK) continue;
+        service_openai_poll();
+        if (last_wall_time > 0 && now < last_wall_time) {
+            ESP_LOGW(TAG, "Wall clock moved backward from %lld to %lld; resetting refresh schedule",
+                     static_cast<long long>(last_wall_time), static_cast<long long>(now));
+            next_auto_refresh[0] = 0;
+            next_auto_refresh[1] = 0;
+        }
+        last_wall_time = now;
+        const Provider provider = (now / 60) % 2 == 0 ? Provider::OpenAI : Provider::Claude;
+        const size_t provider_index = index(provider);
+        if (have_bundle[provider_index] && !credentials_rejected[provider_index] &&
+            now >= next_auto_refresh[provider_index]) {
+            fetch_quota(provider);
         }
     }
 }

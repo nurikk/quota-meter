@@ -13,6 +13,11 @@ Screen select_screen(const AppSnapshot &state)
     return Screen::ProviderLogin;
 }
 
+bool has_cached_usage(const ProviderStatus &status)
+{
+    return status.window_count > 0 || status.extra_usage.present || status.reset_credits.present;
+}
+
 QuotaState quota_after_failure(bool has_last_good)
 {
     return has_last_good ? QuotaState::Stale : QuotaState::Error;
@@ -33,7 +38,7 @@ void apply_credential_failure(ProviderStatus &status, ErrorCode error)
 {
     status.auth = error == ErrorCode::Unauthorized ? AuthState::Expired : AuthState::Authenticated;
     status.error = error;
-    status.quota = quota_after_failure(status.window_count > 0);
+    status.quota = quota_after_failure(has_cached_usage(status));
 }
 
 bool can_fetch_quota(const ProviderStatus &status)

@@ -37,10 +37,11 @@ static char saved_password[65]{};
 static std::atomic_bool connected;
 static std::atomic_bool reconnect_needed;
 static std::atomic_bool provisioning;
+static std::atomic_bool have_saved_credentials;
 static std::atomic<int64_t> connection_failed_since_us;
+static std::atomic<uint32_t> reconnect_delay{1000};
 static httpd_handle_t server;
 static SemaphoreHandle_t credentials_mutex;
-static uint32_t reconnect_delay = 1000;
 extern const uint8_t portal_html_start[] asm("_binary_portal_html_start");
 extern const uint8_t portal_html_end[] asm("_binary_portal_html_end");
 extern const uint8_t portal_js_start[] asm("_binary_portal_js_start");
@@ -49,28 +50,60 @@ extern const uint8_t portal_js_end[] asm("_binary_portal_js_end");
 const char *portal_password() { return ap_password; }
 static void load_setup()
 {
-    uint8_t mac[6]{}; esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP); snprintf(ap_ssid, sizeof(ap_ssid), "QuotaMeter-%02X%02X%02X", mac[3], mac[4], mac[5]);
-    nvs_handle_t handle; if (nvs_open(SETUP_NS, NVS_READWRITE, &handle) != ESP_OK) return; size_t len = sizeof(ap_password);
-    if (nvs_get_str(handle, "password", ap_password, &len) != ESP_OK || strlen(ap_password) != 8) {
-        snprintf(ap_password, sizeof(ap_password), "%08lu", static_cast<unsigned long>(esp_random() % 100000000));
-        if (nvs_set_str(handle, "password", ap_password) == ESP_OK) nvs_commit(handle);
+    uint8_t mac[6]{};
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    snprintf(ap_ssid, sizeof(ap_ssid), "QuotaMeter-%02X%02X%02X", mac[3], mac[4], mac[5]);
+    snprintf(ap_password, sizeof(ap_password), "%08lu",
+             static_cast<unsigned long>(esp_random() % 100000000));
+
+    nvs_handle_t handle;
+    if (nvs_open(SETUP_NS, NVS_READWRITE, &handle) == ESP_OK) {
+        char stored_password[sizeof(ap_password)]{};
+        size_t length = sizeof(stored_password);
+        if (nvs_get_str(handle, "password", stored_password, &length) == ESP_OK &&
+            strlen(stored_password) == 8) {
+            snprintf(ap_password, sizeof(ap_password), "%s", stored_password);
+        } else if (nvs_set_str(handle, "password", ap_password) == ESP_OK) {
+            nvs_commit(handle);
+        }
+        nvs_close(handle);
+    } else {
+        ESP_LOGW(TAG, "Setup password could not be persisted; using an ephemeral password");
     }
-    nvs_close(handle); app_state_set_ap(ap_ssid, ap_password);
+    app_state_set_ap(ap_ssid, ap_password);
 }
 static bool load_wifi()
 {
     nvs_handle_t handle; if (nvs_open(WIFI_NS, NVS_READONLY, &handle) != ESP_OK) return false; size_t ssid_len = sizeof(saved_ssid), password_len = sizeof(saved_password);
-    bool valid = nvs_get_str(handle, "ssid", saved_ssid, &ssid_len) == ESP_OK && nvs_get_str(handle, "password", saved_password, &password_len) == ESP_OK && saved_ssid[0]; nvs_close(handle); return valid;
+    bool valid = nvs_get_str(handle, "ssid", saved_ssid, &ssid_len) == ESP_OK && nvs_get_str(handle, "password", saved_password, &password_len) == ESP_OK && saved_ssid[0];
+    nvs_close(handle);
+    have_saved_credentials = valid;
+    return valid;
 }
 static bool save_wifi(const char *ssid, const char *password)
 {
     nvs_handle_t handle; if (nvs_open(WIFI_NS, NVS_READWRITE, &handle) != ESP_OK) return false;
     esp_err_t result = nvs_set_str(handle, "ssid", ssid); if (result == ESP_OK) result = nvs_set_str(handle, "password", password); if (result == ESP_OK) result = nvs_commit(handle); nvs_close(handle); return result == ESP_OK;
 }
-void clear_wifi_credentials()
+bool clear_wifi_credentials()
 {
-    nvs_handle_t handle; if (nvs_open(WIFI_NS, NVS_READWRITE, &handle) == ESP_OK) { if (nvs_erase_all(handle) == ESP_OK) nvs_commit(handle); nvs_close(handle); }
-    secure_clear(saved_ssid, sizeof(saved_ssid)); secure_clear(saved_password, sizeof(saved_password));
+    if (!credentials_mutex || xSemaphoreTake(credentials_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(WIFI_NS, NVS_READWRITE, &handle);
+    if (result == ESP_OK) {
+        result = nvs_erase_all(handle);
+        if (result == ESP_OK) result = nvs_commit(handle);
+        nvs_close(handle);
+    }
+    if (result == ESP_OK) {
+        secure_clear(saved_ssid, sizeof(saved_ssid));
+        secure_clear(saved_password, sizeof(saved_password));
+        have_saved_credentials = false;
+    } else {
+        ESP_LOGE(TAG, "Wi-Fi credentials could not be cleared error=%d", result);
+    }
+    xSemaphoreGive(credentials_mutex);
+    return result == ESP_OK;
 }
 static void configure_ap()
 {
@@ -107,6 +140,8 @@ bool wifi_connect_and_save(const char *ssid, const char *password)
     if (saved) {
         snprintf(saved_ssid, sizeof(saved_ssid), "%s", ssid);
         snprintf(saved_password, sizeof(saved_password), "%s", password);
+        have_saved_credentials = true;
+        reconnect_delay.store(1000);
         connection_failed_since_us = esp_timer_get_time();
         saved = esp_wifi_set_mode(WIFI_MODE_APSTA) == ESP_OK;
         if (saved) {
@@ -133,7 +168,7 @@ static void wifi_event(void *, esp_event_base_t base, int32_t id, void *data)
         reconnect_needed = false;
         provisioning = false;
         connection_failed_since_us = 0;
-        reconnect_delay = 1000;
+        reconnect_delay.store(1000);
         app_state_set_wifi(WifiState::Connected, ip);
         esp_wifi_set_mode(WIFI_MODE_STA);
     }
@@ -227,7 +262,19 @@ static esp_err_t provider_handler(httpd_req_t *request)
     else if (strcmp(uri, "/api/providers/claude/refresh") == 0) ok = auth_enqueue_refresh(Provider::Claude);
     else if (request->method == HTTP_DELETE && strcmp(uri, "/api/providers/openai") == 0) ok = auth_enqueue_logout(Provider::OpenAI);
     else if (request->method == HTTP_DELETE && strcmp(uri, "/api/providers/claude") == 0) ok = auth_enqueue_logout(Provider::Claude);
-    else if (strcmp(uri, "/api/auth/claude/code") == 0) { char body[2300], callback[2049]; if (read_body(request, body, sizeof(body)) && form_value(body, strlen(body), "code", callback, sizeof(callback))) ok = auth_enqueue_callback(callback); secure_clear(callback, sizeof(callback)); secure_clear(body, sizeof(body)); }
+    else if (strcmp(uri, "/api/auth/claude/code") == 0) {
+        struct CallbackBuffers { char body[2300]; char callback[2049]; };
+        auto *buffers = static_cast<CallbackBuffers *>(calloc(1, sizeof(CallbackBuffers)));
+        if (buffers) {
+            if (read_body(request, buffers->body, sizeof(buffers->body)) &&
+                form_value(buffers->body, strlen(buffers->body), "code", buffers->callback,
+                           sizeof(buffers->callback))) {
+                ok = auth_enqueue_callback(buffers->callback);
+            }
+            secure_clear(buffers, sizeof(*buffers));
+            free(buffers);
+        }
+    }
     httpd_resp_set_type(request, "application/json"); httpd_resp_set_status(request, ok ? "202 Accepted" : "400 Bad Request"); return httpd_resp_sendstr(request, ok ? "{\"accepted\":true}" : "{\"accepted\":false}");
 }
 static void register_uri(const char *uri, httpd_method_t method, esp_err_t (*handler)(httpd_req_t *)) { httpd_uri_t config{}; config.uri = uri; config.method = method; config.handler = handler; httpd_register_uri_handler(server, &config); }
@@ -241,6 +288,7 @@ static esp_err_t captive_handler(httpd_req_t *request)
 static void start_server()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;
     config.max_uri_handlers = 16;
     config.max_req_hdr_len = 1024;
     config.max_uri_len = 256;
@@ -307,15 +355,19 @@ void wifi_portal_init()
 void wifi_task(void *)
 {
     while (true) {
-        if (reconnect_needed && saved_ssid[0]) {
+        if (reconnect_needed && have_saved_credentials) {
             int64_t failed_since = connection_failed_since_us.load();
             if (!provisioning && failed_since > 0 && esp_timer_get_time() - failed_since >= 30000000) {
                 ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
                 configure_ap();
             }
-            vTaskDelay(pdMS_TO_TICKS(reconnect_delay));
-            if (!connected) esp_wifi_connect();
-            reconnect_delay = reconnect_delay < 60000 ? reconnect_delay * 2 : 60000;
+            uint32_t delay = reconnect_delay.load();
+            vTaskDelay(pdMS_TO_TICKS(delay));
+            if (!connected && reconnect_needed) {
+                esp_wifi_connect();
+                const uint32_t next_delay = delay >= 30000 ? 60000 : delay * 2;
+                reconnect_delay.compare_exchange_strong(delay, next_delay);
+            }
         } else {
             vTaskDelay(pdMS_TO_TICKS(500));
         }
