@@ -176,7 +176,7 @@ static esp_err_t js_handler(httpd_req_t *request)
     httpd_resp_set_type(request, "text/javascript"); httpd_resp_set_hdr(request, "Cache-Control", "no-store"); size_t length = static_cast<size_t>(portal_js_end - portal_js_start); if (length && portal_js_start[length - 1] == 0) --length;
     return httpd_resp_send(request, reinterpret_cast<const char *>(portal_js_start), length);
 }
-static const char *auth_name(AuthState state) { const char *names[] = {"signed_out","starting","awaiting_user","exchanging","authenticated","refreshing","error"}; size_t value = static_cast<size_t>(state); return value < 7 ? names[value] : "error"; }
+static const char *auth_name(AuthState state) { const char *names[] = {"signed_out","starting","awaiting_user","exchanging","authenticated","refreshing","error","expired"}; size_t value = static_cast<size_t>(state); return value < sizeof(names) / sizeof(names[0]) ? names[value] : "error"; }
 static const char *quota_name(QuotaState state) { const char *names[] = {"idle","loading","fresh","stale","error"}; size_t value = static_cast<size_t>(state); return value < 5 ? names[value] : "error"; }
 static void provider_json(cJSON *root, const char *name, const ProviderStatus &status)
 {

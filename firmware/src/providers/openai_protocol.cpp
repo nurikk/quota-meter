@@ -1,5 +1,6 @@
 #include "openai_protocol.h"
 #include "../util/base64url.h"
+#include "../domain/state_reducer.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,19 @@ static cJSON *parse_bounded(const char *json, size_t length)
 {
     if (!json || length == 0 || length > 16384) return nullptr;
     return cJSON_ParseWithLength(json, length);
+}
+
+ErrorCode oauth_refresh_error(const HttpResult &response)
+{
+    const ErrorCode error = map_http_error(response.status, response.error);
+    if (response.status != 400 && response.status != 403) return error;
+    cJSON *root = parse_bounded(response.body, response.body_len);
+    cJSON *code = cJSON_GetObjectItemCaseSensitive(root, "error");
+    if (cJSON_IsObject(code)) code = cJSON_GetObjectItemCaseSensitive(code, "code");
+    const bool rejected = cJSON_IsString(code) && code->valuestring &&
+                          strcmp(code->valuestring, "invalid_grant") == 0;
+    cJSON_Delete(root);
+    return rejected ? ErrorCode::Unauthorized : error;
 }
 
 bool openai_user_code_request(char *out, size_t cap)
@@ -187,6 +201,13 @@ bool parse_openai_usage(const char *json, size_t length, ProviderStatus *status)
     if (!cJSON_IsObject(secondary)) secondary = cJSON_GetObjectItemCaseSensitive(rate, "secondary");
     add_window(status, "Primary", primary);
     add_window(status, "Secondary", secondary);
+    status->reset_credits = {};
+    cJSON *credits = cJSON_GetObjectItemCaseSensitive(root, "rate_limit_reset_credits");
+    cJSON *available = cJSON_GetObjectItemCaseSensitive(credits, "available_count");
+    if (cJSON_IsNumber(available) && available->valuedouble >= 0 && available->valuedouble <= UINT32_MAX) {
+        const uint32_t count = static_cast<uint32_t>(available->valuedouble);
+        if (available->valuedouble == count) status->reset_credits = {true, count};
+    }
     cJSON_Delete(root); return status->window_count > 0;
 }
 }

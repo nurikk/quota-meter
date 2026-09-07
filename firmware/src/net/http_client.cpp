@@ -56,7 +56,7 @@ void https_request(const HttpRequest &request, HttpResult *output)
     output->status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
     if (result != ESP_OK && output->error == ErrorCode::None) output->error = ErrorCode::Network;
-    if (output->error == ErrorCode::None) output->error = map_http_error(output->status);
+    output->error = map_http_error(output->status, output->error);
 }
 }
 #endif

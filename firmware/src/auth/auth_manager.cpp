@@ -37,6 +37,7 @@ static QueueHandle_t queue_handle;
 static std::atomic_bool cancelled[2];
 static TokenBundle bundles[2]{};
 static bool have_bundle[2]{};
+static bool credentials_rejected[2]{};
 static char claude_state[129]{};
 static char claude_verifier[129]{};
 static int64_t claude_pending_until;
@@ -81,10 +82,9 @@ static void publish_error(Provider provider, ErrorCode error)
 {
     AppSnapshot snapshot = app_state_get();
     ProviderStatus status = provider == Provider::OpenAI ? snapshot.openai : snapshot.claude;
-    if (error == ErrorCode::Unauthorized || error == ErrorCode::Forbidden || error == ErrorCode::None) status.auth = AuthState::SignedOut;
-    else status.auth = have_bundle[index(provider)] ? AuthState::Authenticated : AuthState::Error;
+    status.auth = credentials_rejected[index(provider)] ? AuthState::Expired
+        : have_bundle[index(provider)] ? AuthState::Authenticated : AuthState::Error;
     status.error = error;
-    if (error != ErrorCode::None) status.quota = quota_after_failure(status.fetched_at > 0);
     status.quota = quota_after_failure(status.window_count > 0);
     app_state_set_provider(provider, status);
 }
@@ -123,6 +123,7 @@ static bool store_tokens(Provider provider, OAuthTokens &tokens)
     secure_clear(&bundles[i], sizeof(bundles[i]));
     bundles[i] = *next_bundle;
     have_bundle[i] = true;
+    credentials_rejected[i] = false;
     secure_clear(next_bundle, sizeof(*next_bundle));
     return true;
 }
@@ -146,9 +147,15 @@ static bool refresh_token(Provider provider)
               body, provider == Provider::Claude ? CLAUDE_BETA : nullptr);
     secure_clear(body, sizeof(body));
     if (http_result->status != 200 || http_result->error != ErrorCode::None) {
-        ErrorCode error = http_result->error;
+        const ErrorCode error = oauth_refresh_error(*http_result);
+        const uint32_t retry_after = http_result->retry_after;
+        ESP_LOGW(TAG, "%s token refresh rejected http=%d error=%u", provider_name(provider),
+                 http_result->status, static_cast<unsigned>(error));
         secure_clear(http_result, sizeof(*http_result));
-        publish_error(provider, error);
+        apply_credential_failure(status, error);
+        credentials_rejected[i] = status.auth == AuthState::Expired;
+        app_state_set_provider(provider, status);
+        schedule_refresh(provider, time(nullptr) + (retry_after > 60 ? retry_after : 60));
         return false;
     }
     secure_clear(parsed_tokens, sizeof(*parsed_tokens));
@@ -170,11 +177,13 @@ static bool refresh_token(Provider provider)
 static void fetch_quota(Provider provider)
 {
     size_t i = index(provider);
-    if (!have_bundle[i]) return;
+    AppSnapshot snapshot = app_state_get();
+    const ProviderStatus &before = provider == Provider::OpenAI ? snapshot.openai : snapshot.claude;
+    if (!have_bundle[i] || credentials_rejected[i] || !can_fetch_quota(before)) return;
     ESP_LOGI(TAG, "%s quota refresh starting", provider_name(provider));
+    schedule_refresh(provider, time(nullptr) + 60);
     if (bundles[i].expires_at <= time(nullptr) + 300 && !refresh_token(provider)) {
         ESP_LOGW(TAG, "%s token refresh failed", provider_name(provider));
-        schedule_refresh(provider, time(nullptr) + 60);
         return;
     }
 
@@ -197,21 +206,20 @@ static void fetch_quota(Provider provider)
             ESP_LOGW(TAG, "%s quota request unauthorized; refreshing token", provider_name(provider));
             secure_clear(http_result, sizeof(*http_result));
             if (refresh_token(provider)) continue;
-            schedule_refresh(provider, time(nullptr) + 60);
             return;
         }
         break;
     }
 
-    AppSnapshot snapshot = app_state_get();
+    snapshot = app_state_get();
     ProviderStatus status = provider == Provider::OpenAI ? snapshot.openai : snapshot.claude;
     if (http_result->status != 200 || http_result->error != ErrorCode::None) {
         const int http_status = http_result->status;
         ErrorCode error = http_result->error;
         uint32_t retry_after = http_result->retry_after;
         secure_clear(http_result, sizeof(*http_result));
-        status.error = error;
-        status.quota = quota_after_failure(status.window_count > 0);
+        apply_credential_failure(status, error);
+        credentials_rejected[i] = status.auth == AuthState::Expired;
         app_state_set_provider(provider, status);
         const int64_t earliest = time(nullptr) + (retry_after > 60 ? retry_after : 60);
         ESP_LOGW(TAG, "%s quota refresh failed http=%d error=%u retry_after=%u",
@@ -484,12 +492,14 @@ void auth_worker_task(void *)
                 token_store_remove(command.provider);
                 secure_clear(&bundles[i], sizeof(bundles[i]));
                 have_bundle[i] = false;
+                credentials_rejected[i] = false;
                 next_auto_refresh[i] = 0;
                 ProviderStatus status{};
                 status.auth = AuthState::SignedOut;
                 app_state_set_provider(command.provider, status);
                 continue;
             }
+            if (command.type == CommandType::Refresh && credentials_rejected[index(command.provider)]) continue;
             if (app_state_get().wifi != WifiState::Connected || time_sync_start_and_wait() != ESP_OK) {
                 publish_error(command.provider, ErrorCode::Network);
                 secure_clear(command.callback, sizeof(command.callback));
@@ -514,7 +524,7 @@ void auth_worker_task(void *)
             last_wall_time = now;
             Provider provider = (now / 60) % 2 == 0 ? Provider::OpenAI : Provider::Claude;
             size_t i = index(provider);
-            if (have_bundle[i] && now >= next_auto_refresh[i]) fetch_quota(provider);
+            if (have_bundle[i] && !credentials_rejected[i] && now >= next_auto_refresh[i]) fetch_quota(provider);
         }
     }
 }

@@ -14,6 +14,7 @@ void format_provider_summary(const ProviderStatus &status, char *output, size_t 
                                        ? "Working"
                                        : status.auth == AuthState::AwaitingUser
                                              ? "Waiting for login"
+                                             : status.auth == AuthState::Expired ? "Session expired"
                                              : status.auth == AuthState::Error ? "Error" : "Sign in required";
     const char *freshness = status.quota == QuotaState::Stale
                                 ? "stale"
@@ -30,8 +31,8 @@ size_t connection_pages(const AppSnapshot &snapshot, ConnectionPage *pages, size
 {
     ConnectionPage ordered[3];
     size_t count = 0;
-    if (is_connected(snapshot.openai)) ordered[count++] = ConnectionPage::Codex;
-    if (is_connected(snapshot.claude)) ordered[count++] = ConnectionPage::Claude;
+    if (is_connected(snapshot.openai) || snapshot.openai.auth == AuthState::Expired) ordered[count++] = ConnectionPage::Codex;
+    if (is_connected(snapshot.claude) || snapshot.claude.auth == AuthState::Expired) ordered[count++] = ConnectionPage::Claude;
     ordered[count++] = ConnectionPage::Add;
 
     const size_t copied = count < capacity ? count : capacity;
@@ -100,6 +101,16 @@ static bool quota_updated(const ProviderStatus &before, const ProviderStatus &af
 ConnectionPage focus_after_usage_change(ConnectionPage current, const AppSnapshot &previous,
                                         const AppSnapshot &current_snapshot)
 {
+    const auto login_active = [](AuthState auth) {
+        return auth == AuthState::Starting || auth == AuthState::AwaitingUser || auth == AuthState::Exchanging;
+    };
+    if (login_active(current_snapshot.openai.auth) || login_active(current_snapshot.claude.auth)) return current;
+    if (current_snapshot.openai.auth == AuthState::Expired && previous.openai.auth != AuthState::Expired)
+        return ConnectionPage::Codex;
+    if (current_snapshot.claude.auth == AuthState::Expired && previous.claude.auth != AuthState::Expired)
+        return ConnectionPage::Claude;
+    if ((current == ConnectionPage::Codex && current_snapshot.openai.auth == AuthState::Expired) ||
+        (current == ConnectionPage::Claude && current_snapshot.claude.auth == AuthState::Expired)) return current;
     if (current == ConnectionPage::Add) return current;
     const bool openai_updated = quota_updated(previous.openai, current_snapshot.openai);
     const bool claude_updated = quota_updated(previous.claude, current_snapshot.claude);
@@ -148,6 +159,16 @@ void format_countdown(int64_t resets_at, int64_t now, char *output, size_t lengt
     }
 }
 
+
+void format_codex_reset_credits(const ProviderStatus &status, char *output, size_t length)
+{
+    if (!output || length == 0) return;
+    if (status.reset_credits.present) {
+        snprintf(output, length, "Reset credits: %lu", static_cast<unsigned long>(status.reset_credits.available_count));
+    } else {
+        snprintf(output, length, "Reset credits: --");
+    }
+}
 
 FooterTone format_dashboard_footer(const ProviderStatus &status, const char *error_message,
                                    char *output, size_t length)

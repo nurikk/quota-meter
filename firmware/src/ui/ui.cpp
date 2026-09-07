@@ -114,6 +114,8 @@ constexpr int CODEX_PRIMARY_Y = 30;
 constexpr int CODEX_MIDDLE_DIVIDER_Y = 149;
 constexpr int CODEX_SECONDARY_Y = 184;
 constexpr int CODEX_SINGLE_Y = 107;
+constexpr int CODEX_RESET_CREDITS_Y = 282;
+constexpr size_t RESET_CREDITS_TEXT_CAPACITY = 32;
 constexpr int CLAUDE_PRIMARY_Y = 4;
 constexpr int CLAUDE_FIRST_DIVIDER_Y = 101;
 constexpr int CLAUDE_SECONDARY_Y = 105;
@@ -470,6 +472,10 @@ void render_codex_dashboard(lv_obj_t *tile, const ProviderStatus &status)
         quota_block(tile, bottom, "7D", CODEX_SINGLE_Y,
                     SEVEN_DAY_WINDOW_MINUTES, COLOR_CODEX);
     }
+    char reset_credits[RESET_CREDITS_TEXT_CAPACITY];
+    format_codex_reset_credits(status, reset_credits, sizeof(reset_credits));
+    dashboard_label(tile, reset_credits, CONTENT_LEFT, CODEX_RESET_CREDITS_Y, CONTENT_WIDTH,
+                    &lv_font_montserrat_16, COLOR_CODEX);
     dashboard_footer(tile, status);
 }
 
@@ -563,6 +569,17 @@ void render_claude_dashboard(lv_obj_t *tile, const ProviderStatus &status)
     dashboard_footer(tile, status);
 }
 
+void render_expired_session(lv_obj_t *tile, Provider provider, size_t index, size_t count)
+{
+    lv_obj_t *view = column(tile);
+    label(view, provider == Provider::OpenAI ? "Codex" : "Claude", &lv_font_montserrat_20);
+    label(view, "Session expired", &lv_font_montserrat_20);
+    label(view, "Your credentials could not be renewed. Sign in again to resume quota updates.",
+          &lv_font_montserrat_14, COLOR_SECONDARY);
+    button(view, "Sign in again", start_provider, reinterpret_cast<void *>(static_cast<uintptr_t>(provider)));
+    render_page_number(view, index, count);
+}
+
 void render_add_option(lv_obj_t *parent, const char *name, const char *description, Provider provider,
                        const ProviderStatus &status)
 {
@@ -622,6 +639,9 @@ void update_pending_provider(const AppSnapshot &snapshot)
     if (is_connected(status)) {
         active_page = pending_provider == Provider::OpenAI ? ConnectionPage::Codex : ConnectionPage::Claude;
         pending_provider_valid = false;
+    } else if (status.auth == AuthState::Expired) {
+        active_page = pending_provider == Provider::OpenAI ? ConnectionPage::Codex : ConnectionPage::Claude;
+        pending_provider_valid = false;
     } else if (status.auth == AuthState::Error) {
         active_page = ConnectionPage::Add;
         pending_provider_valid = false;
@@ -660,10 +680,12 @@ void render_carousel(const AppSnapshot &snapshot)
 
         switch (pages[index]) {
         case ConnectionPage::Codex:
-            render_codex_dashboard(tile, snapshot.openai);
+            if (snapshot.openai.auth == AuthState::Expired) render_expired_session(tile, Provider::OpenAI, index, tile_count);
+            else render_codex_dashboard(tile, snapshot.openai);
             break;
         case ConnectionPage::Claude:
-            render_claude_dashboard(tile, snapshot.claude);
+            if (snapshot.claude.auth == AuthState::Expired) render_expired_session(tile, Provider::Claude, index, tile_count);
+            else render_claude_dashboard(tile, snapshot.claude);
             break;
         case ConnectionPage::Add:
             render_add_page(tile, snapshot, index, tile_count);

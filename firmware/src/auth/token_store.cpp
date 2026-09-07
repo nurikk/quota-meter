@@ -5,7 +5,7 @@
 
 namespace qm {
 namespace {
-constexpr uint32_t QUOTA_VERSION = 2;
+constexpr uint32_t QUOTA_VERSION = 3;
 
 struct QuotaBundle {
     uint32_t version;
@@ -13,6 +13,7 @@ struct QuotaBundle {
     QuotaWindow windows[8];
     uint8_t window_count;
     ClaudeExtraUsage extra_usage;
+    OpenAiResetCredits reset_credits;
     int64_t fetched_at;
 };
 
@@ -75,6 +76,7 @@ esp_err_t quota_store_save(Provider provider, const ProviderStatus &status)
         quota.windows[i] = status.windows[i];
     }
     quota.extra_usage = status.extra_usage;
+    quota.reset_credits = status.reset_credits;
     quota.fetched_at = status.fetched_at;
     nvs_handle_t handle;
     esp_err_t result = nvs_open(name_space(provider), NVS_READWRITE, &handle);
@@ -102,6 +104,7 @@ esp_err_t quota_store_load(Provider provider, ProviderStatus *status)
     memcpy(status->windows, quota.windows, sizeof(status->windows));
     status->window_count = quota.window_count;
     status->extra_usage = quota.extra_usage;
+    status->reset_credits = quota.reset_credits;
     status->fetched_at = quota.fetched_at;
     return ESP_OK;
 }

@@ -25,6 +25,7 @@ bool openai_poll_request(const OpenAiDeviceCode &code, char *output, size_t outp
 bool openai_exchange_request(const char *authorization_code, const char *verifier, char *output, size_t output_len);
 bool openai_refresh_request(const char *refresh_token, char *output, size_t output_len);
 bool parse_openai_device_code(const char *json, size_t length, OpenAiDeviceCode *output);
+ErrorCode oauth_refresh_error(const HttpResult &response);
 bool parse_oauth_tokens(const char *json, size_t length, OAuthTokens *output, bool require_refresh);
 bool openai_account_id_from_jwt(const char *jwt, char *output, size_t output_len);
 bool parse_openai_usage(const char *json, size_t length, ProviderStatus *status);

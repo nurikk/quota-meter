@@ -19,6 +19,7 @@ ConnectionPage focus_after_usage_change(ConnectionPage current, const AppSnapsho
 float elapsed_percent(const QuotaWindow &window, int64_t now, int window_minutes);
 UsageRisk usage_risk(float used_percent, float elapsed_percent);
 void format_countdown(int64_t resets_at, int64_t now, char *output, size_t output_len);
+void format_codex_reset_credits(const ProviderStatus &status, char *output, size_t output_len);
 FooterTone format_dashboard_footer(const ProviderStatus &status, const char *error_message,
                                    char *output, size_t output_len);
 

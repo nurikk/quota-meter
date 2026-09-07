@@ -6,7 +6,7 @@
 namespace qm {
 
 enum class WifiState : uint8_t { Idle, Connecting, Connected, Provisioning, Failed };
-enum class AuthState : uint8_t { SignedOut, Starting, AwaitingUser, Exchanging, Authenticated, Refreshing, Error };
+enum class AuthState : uint8_t { SignedOut, Starting, AwaitingUser, Exchanging, Authenticated, Refreshing, Error, Expired };
 enum class QuotaState : uint8_t { Idle, Loading, Fresh, Stale, Error };
 enum class Screen : uint8_t { WifiSetup, ProviderLogin, OpenAiCode, ClaudeManualCode, Dashboard, FatalHardwareError };
 enum class Provider : uint8_t { OpenAI, Claude };
@@ -40,6 +40,11 @@ struct ClaudeExtraUsage {
     char currency[8]{};
 };
 
+struct OpenAiResetCredits {
+    bool present{};
+    uint32_t available_count{};
+};
+
 struct ProviderStatus {
     AuthState auth;
     QuotaState quota;
@@ -50,6 +55,7 @@ struct ProviderStatus {
     QuotaWindow windows[8];
     uint8_t window_count;
     ClaudeExtraUsage extra_usage;
+    OpenAiResetCredits reset_credits;
     int64_t fetched_at;
 };
 

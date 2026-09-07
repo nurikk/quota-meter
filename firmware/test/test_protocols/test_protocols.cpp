@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <initializer_list>
 #include "auth/pkce.h"
 #include "domain/state_reducer.h"
 #include "portal/portal_logic.h"
@@ -236,15 +237,186 @@ static void test_connection_page_order()
 }
 
 
+static void test_openai_reset_credits_parsing()
+{
+    const struct {
+        const char *field;
+        bool present;
+        uint32_t count;
+    } cases[] = {
+        {",\"rate_limit_reset_credits\":{\"available_count\":1,\"applicable_available_count\":0}", true, 1},
+        {",\"rate_limit_reset_credits\":{\"available_count\":0}", true, 0},
+        {",\"rate_limit_reset_credits\":{\"available_count\":4294967295}", true, UINT32_MAX},
+        {"", false, 0},
+        {",\"rate_limit_reset_credits\":null", false, 0},
+        {",\"rate_limit_reset_credits\":{}", false, 0},
+        {",\"rate_limit_reset_credits\":{\"applicable_available_count\":1}", false, 0},
+        {",\"rate_limit_reset_credits\":{\"available_count\":null}", false, 0},
+        {",\"rate_limit_reset_credits\":{\"available_count\":\"1\"}", false, 0},
+        {",\"rate_limit_reset_credits\":{\"available_count\":true}", false, 0},
+        {",\"rate_limit_reset_credits\":{\"available_count\":-1}", false, 0},
+        {",\"rate_limit_reset_credits\":{\"available_count\":1.5}", false, 0},
+        {",\"rate_limit_reset_credits\":{\"available_count\":4294967296}", false, 0},
+        {",\"rate_limit_reset_credits\":{\"available_count\":1e999}", false, 0},
+    };
+    for (const auto &test : cases) {
+        char json[256] = "{\"rate_limit\":{\"primary_window\":{\"used_percent\":17}}";
+        strcat(json, test.field);
+        strcat(json, "}");
+        ProviderStatus status{};
+        status.reset_credits = {true, 7};
+        TEST_ASSERT_TRUE(parse_openai_usage(json, strlen(json), &status));
+        TEST_ASSERT_EQUAL(test.present, status.reset_credits.present);
+        TEST_ASSERT_EQUAL_UINT32(test.count, status.reset_credits.available_count);
+        TEST_ASSERT_FLOAT_WITHIN(0.01, 17, status.windows[0].used_percent);
+    }
+}
+
+static void test_format_codex_reset_credits()
+{
+    ProviderStatus status{};
+    char text[32];
+    format_codex_reset_credits(status, text, sizeof(text));
+    TEST_ASSERT_EQUAL_STRING("Reset credits: --", text);
+    status.reset_credits = {true, 1};
+    format_codex_reset_credits(status, text, sizeof(text));
+    TEST_ASSERT_EQUAL_STRING("Reset credits: 1", text);
+    status.reset_credits.available_count = 0;
+    format_codex_reset_credits(status, text, sizeof(text));
+    TEST_ASSERT_EQUAL_STRING("Reset credits: 0", text);
+    status.reset_credits.available_count = UINT32_MAX;
+    format_codex_reset_credits(status, text, sizeof(text));
+    TEST_ASSERT_EQUAL_STRING("Reset credits: 4294967295", text);
+}
+
+static void test_oauth_refresh_error_classification()
+{
+    const struct {
+        int status;
+        ErrorCode transport_error;
+        const char *body;
+        ErrorCode expected;
+    } cases[] = {
+        {401, ErrorCode::Network, "", ErrorCode::Unauthorized},
+        {401, ErrorCode::None, "", ErrorCode::Unauthorized},
+        {400, ErrorCode::InvalidResponse, "{\"error\":\"invalid_grant\"}", ErrorCode::Unauthorized},
+        {403, ErrorCode::Forbidden, "{\"error\":{\"code\":\"invalid_grant\"}}", ErrorCode::Unauthorized},
+        {400, ErrorCode::None, "{\"error\":\"invalid_request\"}", ErrorCode::InvalidResponse},
+        {400, ErrorCode::None, "{\"error\":\"invalid_client\"}", ErrorCode::InvalidResponse},
+        {400, ErrorCode::None, "{\"error_description\":\"expired token\"}", ErrorCode::InvalidResponse},
+        {400, ErrorCode::None, "not json", ErrorCode::InvalidResponse},
+        {403, ErrorCode::None, "{\"error\":\"access_denied\"}", ErrorCode::Forbidden},
+        {429, ErrorCode::Network, "{\"error\":\"invalid_grant\"}", ErrorCode::Throttled},
+        {500, ErrorCode::None, "{\"error\":\"invalid_grant\"}", ErrorCode::InvalidResponse},
+        {0, ErrorCode::Network, "", ErrorCode::Network},
+        {200, ErrorCode::Network, "", ErrorCode::Network},
+        {200, ErrorCode::InvalidResponse, "", ErrorCode::InvalidResponse},
+        {200, ErrorCode::None, "{}", ErrorCode::None},
+    };
+    for (const auto &test : cases) {
+        HttpResult response{};
+        response.status = test.status;
+        response.error = test.transport_error;
+        strcpy(response.body, test.body);
+        response.body_len = strlen(test.body);
+        TEST_ASSERT_EQUAL(test.expected, oauth_refresh_error(response));
+    }
+    TEST_ASSERT_EQUAL(ErrorCode::Unauthorized, map_http_error(401, ErrorCode::Network));
+    TEST_ASSERT_EQUAL(ErrorCode::Network, map_http_error(0, ErrorCode::Network));
+}
+
+static void test_expired_credential_state_and_recovery()
+{
+    ProviderStatus status{};
+    status.auth = AuthState::Refreshing;
+    status.window_count = 1;
+    status.windows[0].used_percent = 17;
+    status.fetched_at = 100;
+    apply_credential_failure(status, ErrorCode::Unauthorized);
+    TEST_ASSERT_EQUAL(AuthState::Expired, status.auth);
+    TEST_ASSERT_EQUAL(QuotaState::Stale, status.quota);
+    TEST_ASSERT_EQUAL(100, status.fetched_at);
+    TEST_ASSERT_FALSE(can_fetch_quota(status));
+    char summary[80];
+    format_provider_summary(status, summary, sizeof(summary));
+    TEST_ASSERT_NOT_NULL(strstr(summary, "Session expired"));
+    for (AuthState auth : {AuthState::Starting, AuthState::AwaitingUser, AuthState::Exchanging,
+                           AuthState::SignedOut, AuthState::Error}) {
+        status.auth = auth;
+        TEST_ASSERT_FALSE(can_fetch_quota(status));
+    }
+    status.auth = AuthState::Authenticated;
+    TEST_ASSERT_TRUE(can_fetch_quota(status));
+    status.auth = AuthState::Refreshing;
+    TEST_ASSERT_TRUE(can_fetch_quota(status));
+    for (ErrorCode error : {ErrorCode::Network, ErrorCode::Throttled, ErrorCode::InvalidResponse,
+                            ErrorCode::Forbidden, ErrorCode::Timeout}) {
+        apply_credential_failure(status, error);
+        TEST_ASSERT_EQUAL(AuthState::Authenticated, status.auth);
+        TEST_ASSERT_TRUE(can_fetch_quota(status));
+    }
+    status.window_count = 0;
+    apply_credential_failure(status, ErrorCode::Unauthorized);
+    TEST_ASSERT_EQUAL(QuotaState::Error, status.quota);
+}
+
+static void test_expired_session_navigation()
+{
+    AppSnapshot before{};
+    before.wifi = WifiState::Connected;
+    before.openai.auth = AuthState::Authenticated;
+    before.claude.auth = AuthState::Authenticated;
+    AppSnapshot after = before;
+    apply_credential_failure(after.openai, ErrorCode::Unauthorized);
+    ConnectionPage pages[3];
+    TEST_ASSERT_EQUAL(Screen::Dashboard, select_screen(after));
+    TEST_ASSERT_EQUAL_size_t(3, connection_pages(after, pages, 3));
+    TEST_ASSERT_EQUAL(ConnectionPage::Codex, pages[0]);
+    TEST_ASSERT_EQUAL(ConnectionPage::Claude, pages[1]);
+    TEST_ASSERT_EQUAL(ConnectionPage::Add, pages[2]);
+    TEST_ASSERT_EQUAL(ConnectionPage::Codex, focus_after_usage_change(ConnectionPage::Claude, before, after));
+    before = after;
+    after.claude.quota = QuotaState::Fresh;
+    after.claude.fetched_at = 100;
+    TEST_ASSERT_EQUAL(ConnectionPage::Codex, focus_after_usage_change(ConnectionPage::Codex, before, after));
+    TEST_ASSERT_EQUAL(ConnectionPage::Claude, focus_after_usage_change(ConnectionPage::Claude, before, after));
+    before = after;
+    apply_credential_failure(after.claude, ErrorCode::Unauthorized);
+    TEST_ASSERT_EQUAL(ConnectionPage::Claude, focus_after_usage_change(ConnectionPage::Codex, before, after));
+    TEST_ASSERT_EQUAL_size_t(3, connection_pages(after, pages, 3));
+    for (AuthState auth : {AuthState::Starting, AuthState::AwaitingUser, AuthState::Exchanging}) {
+        after.openai.auth = auth;
+        TEST_ASSERT_EQUAL(ConnectionPage::Add, focus_after_usage_change(ConnectionPage::Add, before, after));
+    }
+    after.openai.auth = AuthState::AwaitingUser;
+    TEST_ASSERT_EQUAL(Screen::OpenAiCode, select_screen(after));
+    after.openai.auth = AuthState::Expired;
+    after.claude.auth = AuthState::AwaitingUser;
+    TEST_ASSERT_EQUAL(Screen::ClaudeManualCode, select_screen(after));
+    after.claude.auth = AuthState::Authenticated;
+    after.openai.auth = AuthState::Authenticated;
+    after.openai.quota = QuotaState::Fresh;
+    after.openai.fetched_at = 200;
+    TEST_ASSERT_EQUAL(ConnectionPage::Codex, focus_after_usage_change(ConnectionPage::Claude, before, after));
+    after.openai.auth = AuthState::SignedOut;
+    TEST_ASSERT_EQUAL_size_t(2, connection_pages(after, pages, 3));
+    TEST_ASSERT_EQUAL(ConnectionPage::Claude, pages[0]);
+}
+
 int main(int, char **)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_oauth_refresh_error_classification);
+    RUN_TEST(test_expired_credential_state_and_recovery);
+    RUN_TEST(test_expired_session_navigation);
     RUN_TEST(test_base64url_vectors);
     RUN_TEST(test_pkce_rfc7636_vector);
     RUN_TEST(test_claude_callback_formats_and_state);
     RUN_TEST(test_claude_authorize_contract);
     RUN_TEST(test_openai_request_and_response_contract);
     RUN_TEST(test_oauth_and_usage_parsing);
+    RUN_TEST(test_openai_reset_credits_parsing);
+    RUN_TEST(test_format_codex_reset_credits);
     RUN_TEST(test_claude_extended_usage_parsing);
     RUN_TEST(test_dashboard_view_model);
     RUN_TEST(test_reducer_and_portal_helpers);
