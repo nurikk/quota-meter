@@ -6,11 +6,11 @@
 namespace qm {
 
 enum class WifiState : uint8_t { Idle, Connecting, Connected, Provisioning, Failed };
-enum class AuthState : uint8_t { SignedOut, Starting, AwaitingUser, Exchanging, Authenticated, Refreshing, Error, Expired };
+enum class AuthState : uint8_t { SignedOut, Authenticated, Refreshing, Error, Expired };
 enum class QuotaState : uint8_t { Idle, Loading, Fresh, Stale, Error };
-enum class Screen : uint8_t { WifiSetup, ProviderLogin, OpenAiCode, ClaudeManualCode, Dashboard, FatalHardwareError };
+enum class Screen : uint8_t { WifiSetup, TokenImport, Dashboard, FatalHardwareError };
 enum class Provider : uint8_t { OpenAI, Claude };
-enum class ErrorCode : uint8_t { None, Network, InvalidResponse, Unauthorized, Forbidden, Throttled, Storage, StateMismatch, Timeout };
+enum class ErrorCode : uint8_t { None, Network, InvalidResponse, Unauthorized, Forbidden, Throttled, Storage };
 
 struct QuotaWindow {
     char label[40]{};
@@ -50,8 +50,6 @@ struct ProviderStatus {
     QuotaState quota;
     ErrorCode error;
     char plan[32];
-    char login_url[768];
-    char user_code[32];
     QuotaWindow windows[8];
     uint8_t window_count;
     ClaudeExtraUsage extra_usage;

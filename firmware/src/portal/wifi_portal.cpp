@@ -2,8 +2,6 @@
 #ifdef ESP_PLATFORM
 #include "portal_logic.h"
 #include "../app/app_state.h"
-#include "../auth/auth_manager.h"
-#include "../auth/pkce.h"
 #include "../auth/token_store.h"
 #include "../providers/cJSON.h"
 #include "esp_event.h"
@@ -211,7 +209,7 @@ static esp_err_t js_handler(httpd_req_t *request)
     httpd_resp_set_type(request, "text/javascript"); httpd_resp_set_hdr(request, "Cache-Control", "no-store"); size_t length = static_cast<size_t>(portal_js_end - portal_js_start); if (length && portal_js_start[length - 1] == 0) --length;
     return httpd_resp_send(request, reinterpret_cast<const char *>(portal_js_start), length);
 }
-static const char *auth_name(AuthState state) { const char *names[] = {"signed_out","starting","awaiting_user","exchanging","authenticated","refreshing","error","expired"}; size_t value = static_cast<size_t>(state); return value < sizeof(names) / sizeof(names[0]) ? names[value] : "error"; }
+static const char *auth_name(AuthState state) { const char *names[] = {"signed_out","authenticated","refreshing","error","expired"}; size_t value = static_cast<size_t>(state); return value < sizeof(names) / sizeof(names[0]) ? names[value] : "error"; }
 static const char *quota_name(QuotaState state) { const char *names[] = {"idle","loading","fresh","stale","error"}; size_t value = static_cast<size_t>(state); return value < 5 ? names[value] : "error"; }
 static void provider_json(cJSON *root, const char *name, const ProviderStatus &status)
 {
@@ -253,30 +251,6 @@ static esp_err_t wifi_save_handler(httpd_req_t *request)
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_sendstr(request, saved ? "{\"ok\":true}" : "{\"ok\":false}");
 }
-static esp_err_t provider_handler(httpd_req_t *request)
-{
-    if (!mutation_allowed(request)) return ESP_OK; const char *uri = request->uri; bool ok = false;
-    if (strcmp(uri, "/api/auth/openai/start") == 0) ok = auth_enqueue_start(Provider::OpenAI);
-    else if (strcmp(uri, "/api/auth/claude/start") == 0) ok = auth_enqueue_start(Provider::Claude);
-    else if (strcmp(uri, "/api/providers/openai/refresh") == 0) ok = auth_enqueue_refresh(Provider::OpenAI);
-    else if (strcmp(uri, "/api/providers/claude/refresh") == 0) ok = auth_enqueue_refresh(Provider::Claude);
-    else if (request->method == HTTP_DELETE && strcmp(uri, "/api/providers/openai") == 0) ok = auth_enqueue_logout(Provider::OpenAI);
-    else if (request->method == HTTP_DELETE && strcmp(uri, "/api/providers/claude") == 0) ok = auth_enqueue_logout(Provider::Claude);
-    else if (strcmp(uri, "/api/auth/claude/code") == 0) {
-        struct CallbackBuffers { char body[2300]; char callback[2049]; };
-        auto *buffers = static_cast<CallbackBuffers *>(calloc(1, sizeof(CallbackBuffers)));
-        if (buffers) {
-            if (read_body(request, buffers->body, sizeof(buffers->body)) &&
-                form_value(buffers->body, strlen(buffers->body), "code", buffers->callback,
-                           sizeof(buffers->callback))) {
-                ok = auth_enqueue_callback(buffers->callback);
-            }
-            secure_clear(buffers, sizeof(*buffers));
-            free(buffers);
-        }
-    }
-    httpd_resp_set_type(request, "application/json"); httpd_resp_set_status(request, ok ? "202 Accepted" : "400 Bad Request"); return httpd_resp_sendstr(request, ok ? "{\"accepted\":true}" : "{\"accepted\":false}");
-}
 static void register_uri(const char *uri, httpd_method_t method, esp_err_t (*handler)(httpd_req_t *)) { httpd_uri_t config{}; config.uri = uri; config.method = method; config.handler = handler; httpd_register_uri_handler(server, &config); }
 static esp_err_t captive_handler(httpd_req_t *request)
 {
@@ -299,10 +273,6 @@ static void start_server()
     register_uri("/api/status", HTTP_GET, status_handler);
     register_uri("/api/wifi/scan", HTTP_GET, scan_handler);
     register_uri("/api/wifi", HTTP_POST, wifi_save_handler);
-    const char *posts[] = {"/api/auth/openai/start","/api/auth/claude/start","/api/auth/claude/code","/api/providers/openai/refresh","/api/providers/claude/refresh"};
-    for (const char *uri : posts) register_uri(uri, HTTP_POST, provider_handler);
-    register_uri("/api/providers/openai", HTTP_DELETE, provider_handler);
-    register_uri("/api/providers/claude", HTTP_DELETE, provider_handler);
     register_uri("/*", HTTP_GET, captive_handler);
 }
 static void dns_task(void *)

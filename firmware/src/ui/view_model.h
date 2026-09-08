@@ -4,7 +4,7 @@
 #include "../domain/models.h"
 namespace qm {
 
-enum class ConnectionPage : uint8_t { Codex, Claude, Add };
+enum class ConnectionPage : uint8_t { Codex, Claude, Import };
 enum class UsageRisk : uint8_t { Normal, Warning, High };
 enum class FooterTone : uint8_t { Normal, Warning, Error };
 

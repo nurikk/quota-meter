@@ -10,12 +10,9 @@ void format_provider_summary(const ProviderStatus &status, char *output, size_t 
                            ? "Connected"
                            : status.auth == AuthState::Refreshing
                                  ? "Refreshing"
-                                 : status.auth == AuthState::Starting || status.auth == AuthState::Exchanging
-                                       ? "Working"
-                                       : status.auth == AuthState::AwaitingUser
-                                             ? "Waiting for login"
-                                             : status.auth == AuthState::Expired ? "Session expired"
-                                             : status.auth == AuthState::Error ? "Error" : "Sign in required";
+                                 : status.auth == AuthState::Expired
+                                       ? "Credentials expired"
+                                       : status.auth == AuthState::Error ? "Error" : "Import required";
     const char *freshness = status.quota == QuotaState::Stale
                                 ? "stale"
                                 : status.quota == QuotaState::Fresh ? "fresh" : "no quota";
@@ -33,7 +30,7 @@ size_t connection_pages(const AppSnapshot &snapshot, ConnectionPage *pages, size
     size_t count = 0;
     if (is_connected(snapshot.openai) || snapshot.openai.auth == AuthState::Expired) ordered[count++] = ConnectionPage::Codex;
     if (is_connected(snapshot.claude) || snapshot.claude.auth == AuthState::Expired) ordered[count++] = ConnectionPage::Claude;
-    ordered[count++] = ConnectionPage::Add;
+    ordered[count++] = ConnectionPage::Import;
 
     const size_t copied = count < capacity ? count : capacity;
     for (size_t index = 0; index < copied; ++index) pages[index] = ordered[index];
@@ -101,17 +98,13 @@ static bool quota_updated(const ProviderStatus &before, const ProviderStatus &af
 ConnectionPage focus_after_usage_change(ConnectionPage current, const AppSnapshot &previous,
                                         const AppSnapshot &current_snapshot)
 {
-    const auto login_active = [](AuthState auth) {
-        return auth == AuthState::Starting || auth == AuthState::AwaitingUser || auth == AuthState::Exchanging;
-    };
-    if (login_active(current_snapshot.openai.auth) || login_active(current_snapshot.claude.auth)) return current;
     if (current_snapshot.openai.auth == AuthState::Expired && previous.openai.auth != AuthState::Expired)
         return ConnectionPage::Codex;
     if (current_snapshot.claude.auth == AuthState::Expired && previous.claude.auth != AuthState::Expired)
         return ConnectionPage::Claude;
     if ((current == ConnectionPage::Codex && current_snapshot.openai.auth == AuthState::Expired) ||
         (current == ConnectionPage::Claude && current_snapshot.claude.auth == AuthState::Expired)) return current;
-    if (current == ConnectionPage::Add) return current;
+    if (current == ConnectionPage::Import) return current;
     const bool openai_updated = quota_updated(previous.openai, current_snapshot.openai);
     const bool claude_updated = quota_updated(previous.claude, current_snapshot.claude);
     if (!openai_updated && !claude_updated) return current;

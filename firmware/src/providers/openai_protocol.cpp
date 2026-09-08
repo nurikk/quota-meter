@@ -51,93 +51,23 @@ ErrorCode oauth_refresh_error(const HttpResult &response)
     return rejected ? ErrorCode::Unauthorized : error;
 }
 
-bool openai_user_code_request(char *out, size_t cap)
+bool openai_refresh_request(const char *refresh, char *out, size_t cap)
 {
-    int count = snprintf(out, cap, "{\"client_id\":\"%s\"}", OPENAI_CLIENT_ID);
-    return count > 0 && static_cast<size_t>(count) < cap;
-}
-
-bool openai_poll_request(const OpenAiDeviceCode &code, char *out, size_t cap)
-{
+    if (!refresh || strlen(refresh) > 4096) return false;
     cJSON *root = cJSON_CreateObject();
     if (!root) return false;
-    cJSON_AddStringToObject(root, "device_auth_id", code.device_auth_id);
-    cJSON_AddStringToObject(root, "user_code", code.user_code);
-    char *text = cJSON_PrintUnformatted(root); cJSON_Delete(root);
-    if (!text || strlen(text) >= cap) { cJSON_free(text); return false; }
-    memcpy(out, text, strlen(text) + 1); cJSON_free(text); return true;
-}
-
-static bool token_request(const char *grant, const char *value_key, const char *value, const char *verifier, char *out, size_t cap)
-{
-    if (!value || strlen(value) > 4096) return false;
-    cJSON *root = cJSON_CreateObject(); if (!root) return false;
-    cJSON_AddStringToObject(root, "client_id", OPENAI_CLIENT_ID); cJSON_AddStringToObject(root, "grant_type", grant);
-    cJSON_AddStringToObject(root, value_key, value);
-    if (verifier) { cJSON_AddStringToObject(root, "redirect_uri", OPENAI_REDIRECT_URI); cJSON_AddStringToObject(root, "code_verifier", verifier); }
-    char *text = cJSON_PrintUnformatted(root); cJSON_Delete(root);
-    if (!text || strlen(text) >= cap) { cJSON_free(text); return false; }
-    memcpy(out, text, strlen(text) + 1); cJSON_free(text); return true;
-}
-
-static bool form_append(char *out, size_t cap, size_t *used, const char *value, bool encode)
-{
-    static constexpr char HEX[] = "0123456789ABCDEF";
-    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(value); *p; ++p) {
-        bool unreserved = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-            (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.' || *p == '~';
-        size_t needed = encode && !unreserved ? 3 : 1;
-        if (*used + needed >= cap) return false;
-        if (needed == 1) out[(*used)++] = static_cast<char>(*p);
-        else {
-            out[(*used)++] = '%';
-            out[(*used)++] = HEX[*p >> 4];
-            out[(*used)++] = HEX[*p & 15];
-        }
+    cJSON_AddStringToObject(root, "client_id", OPENAI_CLIENT_ID);
+    cJSON_AddStringToObject(root, "grant_type", "refresh_token");
+    cJSON_AddStringToObject(root, "refresh_token", refresh);
+    char *text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!text || strlen(text) >= cap) {
+        cJSON_free(text);
+        return false;
     }
-    out[*used] = 0;
+    memcpy(out, text, strlen(text) + 1);
+    cJSON_free(text);
     return true;
-}
-
-bool openai_exchange_request(const char *code, const char *verifier, char *out, size_t cap)
-{
-    if (!code || !verifier || !out || cap == 0 || strlen(code) > 4096 || strlen(verifier) > 128) return false;
-    size_t used = 0;
-    out[0] = 0;
-    return form_append(out, cap, &used, "grant_type=authorization_code&code=", false) &&
-        form_append(out, cap, &used, code, true) &&
-        form_append(out, cap, &used, "&redirect_uri=", false) &&
-        form_append(out, cap, &used, OPENAI_REDIRECT_URI, true) &&
-        form_append(out, cap, &used, "&client_id=", false) &&
-        form_append(out, cap, &used, OPENAI_CLIENT_ID, true) &&
-        form_append(out, cap, &used, "&code_verifier=", false) &&
-        form_append(out, cap, &used, verifier, true);
-}
-bool openai_refresh_request(const char *refresh, char *out, size_t cap)
-{ return token_request("refresh_token", "refresh_token", refresh, nullptr, out, cap); }
-
-bool parse_openai_device_code(const char *json, size_t length, OpenAiDeviceCode *out)
-{
-    if (!out) return false; memset(out, 0, sizeof(*out)); cJSON *root = parse_bounded(json, length); if (!root) return false;
-    bool ok = json_string(root, "device_auth_id", out->device_auth_id, sizeof(out->device_auth_id));
-    if (!json_string(root, "user_code", out->user_code, sizeof(out->user_code))) ok = json_string(root, "usercode", out->user_code, sizeof(out->user_code));
-    cJSON *interval = cJSON_GetObjectItemCaseSensitive(root, "interval");
-    if (cJSON_IsNumber(interval) && integer_in_range(interval->valuedouble, 1, 60)) {
-        out->interval = static_cast<uint32_t>(interval->valuedouble);
-    } else if (cJSON_IsString(interval) && interval->valuestring) {
-        uint32_t parsed_interval = 0;
-        for (const unsigned char *cursor = reinterpret_cast<const unsigned char *>(interval->valuestring);
-             *cursor; ++cursor) {
-            if (!isdigit(*cursor) || parsed_interval > 6) {
-                parsed_interval = 0;
-                break;
-            }
-            parsed_interval = parsed_interval * 10 + (*cursor - '0');
-        }
-        if (parsed_interval >= 1 && parsed_interval <= 60) out->interval = parsed_interval;
-    }
-    if (out->interval == 0) ok = false;
-    cJSON_Delete(root); return ok;
 }
 
 bool parse_oauth_tokens(const char *json, size_t length, OAuthTokens *out, bool require_refresh)

@@ -2,7 +2,6 @@
 #ifdef ESP_PLATFORM
 #include "view_model.h"
 #include "../app/app_state.h"
-#include "../auth/auth_manager.h"
 #include "../domain/state_reducer.h"
 #include "../portal/portal_logic.h"
 #include "../portal/wifi_portal.h"
@@ -23,7 +22,6 @@ namespace qm {
 namespace {
 
 constexpr uint32_t COLOR_BACKGROUND = 0x080c10;
-constexpr uint32_t COLOR_SURFACE = 0x121820;
 constexpr uint32_t COLOR_BORDER = 0x26313a;
 constexpr uint32_t COLOR_PRIMARY = 0xf2f4f6;
 constexpr uint32_t COLOR_SECONDARY = 0x8d98a3;
@@ -48,12 +46,8 @@ constexpr int DASHBOARD_TEXT_RIGHT = SCREEN_WIDTH - 4;
 constexpr int DASHBOARD_PERCENT_RIGHT = SCREEN_WIDTH - 6;
 constexpr int COLUMN_PADDING = 12;
 constexpr int COLUMN_GAP = 8;
-constexpr int CARD_PADDING = 10;
-constexpr int CARD_GAP = 5;
-constexpr int SURFACE_BORDER_WIDTH = 1;
-constexpr int SURFACE_RADIUS = 12;
 constexpr int BUTTON_HEIGHT = 44;
-constexpr int LOGIN_QR_SIZE = 210;
+constexpr int WIFI_QR_SIZE = 210;
 
 constexpr size_t MAX_CONNECTION_PAGES = 3;
 constexpr size_t MAX_QUOTA_BINDINGS = 6;
@@ -65,8 +59,6 @@ constexpr size_t TIMEZONE_TEXT_CAPACITY = 8;
 constexpr size_t FOOTER_TEXT_CAPACITY = 64;
 constexpr size_t WIFI_PAYLOAD_CAPACITY = 128;
 constexpr size_t WIFI_CREDENTIALS_CAPACITY = 96;
-constexpr size_t LOGIN_INSTRUCTIONS_CAPACITY = 128;
-constexpr size_t PORTAL_TEXT_CAPACITY = 160;
 constexpr size_t UTILIZATION_TEXT_CAPACITY = 20;
 constexpr size_t SPEND_TEXT_CAPACITY = 40;
 constexpr size_t LIMIT_TEXT_CAPACITY = 48;
@@ -162,8 +154,6 @@ lv_obj_t *root;
 TileEntry tiles[MAX_CONNECTION_PAGES];
 size_t tile_count;
 ConnectionPage active_page = ConnectionPage::Codex;
-bool pending_provider_valid;
-Provider pending_provider;
 
 struct QuotaBinding {
     QuotaWindow window;
@@ -181,7 +171,7 @@ const char *page_name(ConnectionPage page)
     switch (page) {
     case ConnectionPage::Codex: return "Codex";
     case ConnectionPage::Claude: return "Claude";
-    case ConnectionPage::Add: return "Add";
+    case ConnectionPage::Import: return "Import";
     }
     return "Unknown";
 }
@@ -189,15 +179,6 @@ const char *page_name(ConnectionPage page)
 bool is_connected(const ProviderStatus &status)
 {
     return status.auth == AuthState::Authenticated || status.auth == AuthState::Refreshing;
-}
-
-void style_surface(lv_obj_t *object)
-{
-    lv_obj_set_style_bg_color(object, lv_color_hex(COLOR_SURFACE), 0);
-    lv_obj_set_style_bg_opa(object, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(object, lv_color_hex(COLOR_BORDER), 0);
-    lv_obj_set_style_border_width(object, SURFACE_BORDER_WIDTH, 0);
-    lv_obj_set_style_radius(object, SURFACE_RADIUS, 0);
 }
 
 lv_obj_t *column(lv_obj_t *parent)
@@ -249,26 +230,6 @@ lv_obj_t *qr(lv_obj_t *parent, const char *text, int size)
     lv_qrcode_set_light_color(value, lv_color_white());
     lv_qrcode_update(value, text, strlen(text));
     return value;
-}
-
-void start_provider(lv_event_t *event)
-{
-    pending_provider = static_cast<Provider>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
-    pending_provider_valid = true;
-    active_page = ConnectionPage::Add;
-    auth_enqueue_start(pending_provider);
-}
-
-void refresh_provider(lv_event_t *event)
-{
-    auth_enqueue_refresh(static_cast<Provider>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event))));
-}
-
-void logout_provider(lv_event_t *event)
-{
-    pending_provider_valid = false;
-    active_page = ConnectionPage::Add;
-    auth_enqueue_logout(static_cast<Provider>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event))));
 }
 
 void reset_wifi(lv_event_t *)
@@ -408,17 +369,13 @@ const char *error_message(ErrorCode error)
     case ErrorCode::InvalidResponse:
         return "Provider response was invalid";
     case ErrorCode::Unauthorized:
-        return "Login expired";
+        return "Credentials expired";
     case ErrorCode::Forbidden:
         return "Account access was rejected";
     case ErrorCode::Throttled:
         return "Provider is rate limiting requests";
     case ErrorCode::Storage:
         return "Credential storage failed";
-    case ErrorCode::StateMismatch:
-        return "Login state did not match";
-    case ErrorCode::Timeout:
-        return "Provider request timed out";
     case ErrorCode::None:
         return nullptr;
     }
@@ -574,53 +531,21 @@ void render_expired_session(lv_obj_t *tile, Provider provider, size_t index, siz
 {
     lv_obj_t *view = column(tile);
     label(view, provider == Provider::OpenAI ? "Codex" : "Claude", &lv_font_montserrat_20);
-    label(view, "Session expired", &lv_font_montserrat_20);
-    label(view, "Your credentials could not be renewed. Sign in again to resume quota updates.",
+    label(view, "Credentials expired", &lv_font_montserrat_20);
+    label(view, "Reconnect USB and run firmware/tools/upload_tokens.py to replace them.",
           &lv_font_montserrat_14, COLOR_SECONDARY);
-    button(view, "Sign in again", start_provider, reinterpret_cast<void *>(static_cast<uintptr_t>(provider)));
     render_page_number(view, index, count);
 }
 
-void render_add_option(lv_obj_t *parent, const char *name, const char *description, Provider provider,
-                       const ProviderStatus &status)
-{
-    lv_obj_t *card = lv_obj_create(parent);
-    lv_obj_set_width(card, lv_pct(CONTENT_PERCENT));
-    lv_obj_set_height(card, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_all(card, CARD_PADDING, 0);
-    lv_obj_set_style_pad_gap(card, CARD_GAP, 0);
-    style_surface(card);
-    label(card, name, &lv_font_montserrat_16);
-    label(card, description, &lv_font_montserrat_12, COLOR_SECONDARY);
-
-    if (status.auth == AuthState::Starting || status.auth == AuthState::Exchanging) {
-        label(card, "Starting login...", &lv_font_montserrat_14, COLOR_SECONDARY);
-    } else {
-        if (status.auth == AuthState::Error) {
-            label(card, error_message(status.error), &lv_font_montserrat_12, COLOR_HIGH);
-        }
-        button(card, "Login", start_provider, reinterpret_cast<void *>(static_cast<uintptr_t>(provider)));
-    }
-}
-
-void render_add_page(lv_obj_t *tile, const AppSnapshot &snapshot, size_t index, size_t count)
+void render_import_page(lv_obj_t *tile, size_t index, size_t count)
 {
     lv_obj_t *view = column(tile);
-    label(view, "Add connection", &lv_font_montserrat_20);
-    label(view, "Choose a quota provider. These private integrations may change without notice.",
+    label(view, "USB token import", &lv_font_montserrat_20);
+    label(view, "Connect this device to your computer, then run:",
+          &lv_font_montserrat_14, COLOR_SECONDARY);
+    label(view, "python firmware/tools/upload_tokens.py", &lv_font_montserrat_16);
+    label(view, "Codex and Claude credentials are read locally and sent only over USB.",
           &lv_font_montserrat_12, COLOR_SECONDARY);
-
-    if (!is_connected(snapshot.openai)) {
-        render_add_option(view, "Codex", "Connect an OpenAI Codex account.", Provider::OpenAI, snapshot.openai);
-    }
-    if (!is_connected(snapshot.claude)) {
-        render_add_option(view, "Claude", "Connect a Claude subscription.", Provider::Claude, snapshot.claude);
-    }
-    if (is_connected(snapshot.openai) && is_connected(snapshot.claude)) {
-        label(view, "All supported connections are already added.", &lv_font_montserrat_14, COLOR_SECONDARY);
-    }
-
     render_page_number(view, index, count);
 }
 
@@ -636,26 +561,8 @@ void tile_changed(lv_event_t *event)
     }
 }
 
-void update_pending_provider(const AppSnapshot &snapshot)
-{
-    if (!pending_provider_valid) return;
-    const ProviderStatus &status = pending_provider == Provider::OpenAI ? snapshot.openai : snapshot.claude;
-    if (is_connected(status)) {
-        active_page = pending_provider == Provider::OpenAI ? ConnectionPage::Codex : ConnectionPage::Claude;
-        pending_provider_valid = false;
-    } else if (status.auth == AuthState::Expired) {
-        active_page = pending_provider == Provider::OpenAI ? ConnectionPage::Codex : ConnectionPage::Claude;
-        pending_provider_valid = false;
-    } else if (status.auth == AuthState::Error) {
-        active_page = ConnectionPage::Add;
-        pending_provider_valid = false;
-    }
-}
-
 void render_carousel(const AppSnapshot &snapshot)
 {
-    update_pending_provider(snapshot);
-
     ConnectionPage pages[MAX_CONNECTION_PAGES];
     tile_count = connection_pages(snapshot, pages, MAX_CONNECTION_PAGES);
     lv_obj_t *tileview = lv_tileview_create(root);
@@ -691,8 +598,8 @@ void render_carousel(const AppSnapshot &snapshot)
             if (snapshot.claude.auth == AuthState::Expired) render_expired_session(tile, Provider::Claude, index, tile_count);
             else render_claude_dashboard(tile, snapshot.claude);
             break;
-        case ConnectionPage::Add:
-            render_add_page(tile, snapshot, index, tile_count);
+        case ConnectionPage::Import:
+            render_import_page(tile, index, tile_count);
             break;
         }
     }
@@ -709,42 +616,12 @@ void render_wifi(const AppSnapshot &snapshot)
     label(view, "Scan the Wi-Fi QR, then open http://192.168.4.1", &lv_font_montserrat_12, COLOR_SECONDARY);
     char payload[WIFI_PAYLOAD_CAPACITY];
     if (wifi_qr_payload(snapshot.ap_ssid, snapshot.ap_password, payload, sizeof(payload))) {
-        qr(view, payload, LOGIN_QR_SIZE);
+        qr(view, payload, WIFI_QR_SIZE);
     }
     char credentials[WIFI_CREDENTIALS_CAPACITY];
     snprintf(credentials, sizeof(credentials), "Network: %s\nPassword: %s", snapshot.ap_ssid, snapshot.ap_password);
     label(view, credentials);
     button(view, "Clear credentials & restart", reset_wifi);
-}
-
-void render_openai(const AppSnapshot &snapshot)
-{
-    lv_obj_t *view = column(root);
-    label(view, "OpenAI device login", &lv_font_montserrat_20);
-    qr(view, snapshot.openai.login_url, LOGIN_QR_SIZE);
-    char text[LOGIN_INSTRUCTIONS_CAPACITY];
-    snprintf(text, sizeof(text), "Open %s\nand enter code: %s\nExpires after 15 minutes.",
-             snapshot.openai.login_url, snapshot.openai.user_code);
-    label(view, text, &lv_font_montserrat_12, COLOR_SECONDARY);
-    button(view, "Cancel", logout_provider,
-           reinterpret_cast<void *>(static_cast<uintptr_t>(Provider::OpenAI)));
-}
-
-void render_claude(const AppSnapshot &snapshot)
-{
-    lv_obj_t *view = column(root);
-    label(view, "Claude login", &lv_font_montserrat_20);
-    qr(view, snapshot.claude.login_url, LOGIN_QR_SIZE);
-    label(view, "Complete authorization, then paste the callback URL or code#state into the authenticated portal.",
-          &lv_font_montserrat_12, COLOR_SECONDARY);
-    char portal[PORTAL_TEXT_CAPACITY];
-    const char *host = snapshot.sta_ip[0] && strcmp(snapshot.sta_ip, "0.0.0.0") != 0
-                           ? snapshot.sta_ip
-                           : "192.168.4.1";
-    snprintf(portal, sizeof(portal), "Portal: http://%s/?p=%s", host, snapshot.ap_password);
-    label(view, portal, &lv_font_montserrat_12, COLOR_SECONDARY);
-    button(view, "Cancel", logout_provider,
-           reinterpret_cast<void *>(static_cast<uintptr_t>(Provider::Claude)));
 }
 
 void render(const AppSnapshot &snapshot)
@@ -755,14 +632,8 @@ void render(const AppSnapshot &snapshot)
     case Screen::WifiSetup:
         render_wifi(snapshot);
         break;
-    case Screen::OpenAiCode:
-        render_openai(snapshot);
-        break;
-    case Screen::ClaudeManualCode:
-        render_claude(snapshot);
-        break;
     case Screen::Dashboard:
-    case Screen::ProviderLogin:
+    case Screen::TokenImport:
         render_carousel(snapshot);
         break;
     default:

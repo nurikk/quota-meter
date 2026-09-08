@@ -3,7 +3,6 @@ idf_component_register(
         "main.cpp"
         "app/app_state.cpp"
         "auth/auth_manager.cpp"
-        "auth/pkce.cpp"
         "auth/token_store.cpp"
         "console/wifi_console.cpp"
         "domain/state_reducer.cpp"
@@ -20,6 +19,6 @@ idf_component_register(
         "util/base64url.cpp"
     INCLUDE_DIRS "." "app" "auth" "console" "domain" "net" "portal" "providers" "ui" "util"
     REQUIRES esp32_s3_touch_amoled_1_75c espressif__cjson lvgl
-    PRIV_REQUIRES console esp_event esp_http_client esp_netif esp_wifi lwip mbedtls nvs_flash esp_timer
+    PRIV_REQUIRES console esp_event esp_http_client esp_netif esp_wifi lwip nvs_flash esp_timer
     EMBED_TXTFILES "portal/portal.html" "portal/portal.js"
 )

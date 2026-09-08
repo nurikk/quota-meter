@@ -31,4 +31,18 @@ bool same_origin(const char *origin, const char *host)
     const char *authority = origin + strlen(prefix); const char *end = strchr(authority, '/'); size_t len = end ? static_cast<size_t>(end - authority) : strlen(authority);
     return len == strlen(host) && memcmp(authority, host, len) == 0;
 }
+
+bool constant_time_equal(const char *left, const char *right)
+{
+    if (!left || !right) return false;
+    size_t left_len = strlen(left), right_len = strlen(right);
+    size_t maximum = left_len > right_len ? left_len : right_len;
+    unsigned difference = static_cast<unsigned>(left_len ^ right_len);
+    for (size_t index = 0; index < maximum; ++index) {
+        unsigned char left_byte = index < left_len ? static_cast<unsigned char>(left[index]) : 0;
+        unsigned char right_byte = index < right_len ? static_cast<unsigned char>(right[index]) : 0;
+        difference |= left_byte ^ right_byte;
+    }
+    return difference == 0;
+}
 }

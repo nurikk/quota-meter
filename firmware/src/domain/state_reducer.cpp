@@ -5,12 +5,10 @@ Screen select_screen(const AppSnapshot &state)
 {
     if (state.hardware_error) return Screen::FatalHardwareError;
     if (state.wifi != WifiState::Connected) return Screen::WifiSetup;
-    if (state.openai.auth == AuthState::AwaitingUser) return Screen::OpenAiCode;
-    if (state.claude.auth == AuthState::AwaitingUser) return Screen::ClaudeManualCode;
     if (state.openai.auth == AuthState::Authenticated || state.claude.auth == AuthState::Authenticated ||
         state.openai.auth == AuthState::Refreshing || state.claude.auth == AuthState::Refreshing ||
         state.openai.auth == AuthState::Expired || state.claude.auth == AuthState::Expired) return Screen::Dashboard;
-    return Screen::ProviderLogin;
+    return Screen::TokenImport;
 }
 
 bool has_cached_usage(const ProviderStatus &status)

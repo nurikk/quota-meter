@@ -19,9 +19,9 @@
 namespace qm {
 namespace {
 
-TokenBundle *import_bundle;
-Provider import_provider;
-bool import_active;
+TokenBundle *upload_bundle;
+Provider upload_provider;
+bool upload_active;
 size_t field_lengths[4];
 
 enum class ImportField : uint8_t { Access, Refresh, Id, Account };
@@ -55,17 +55,17 @@ char *field_buffer(ImportField field, size_t *capacity, size_t **length)
     *length = &field_lengths[index];
     switch (field) {
     case ImportField::Access:
-        *capacity = sizeof(import_bundle->oauth.access_token);
-        return import_bundle->oauth.access_token;
+        *capacity = sizeof(upload_bundle->oauth.access_token);
+        return upload_bundle->oauth.access_token;
     case ImportField::Refresh:
-        *capacity = sizeof(import_bundle->oauth.refresh_token);
-        return import_bundle->oauth.refresh_token;
+        *capacity = sizeof(upload_bundle->oauth.refresh_token);
+        return upload_bundle->oauth.refresh_token;
     case ImportField::Id:
-        *capacity = sizeof(import_bundle->oauth.id_token);
-        return import_bundle->oauth.id_token;
+        *capacity = sizeof(upload_bundle->oauth.id_token);
+        return upload_bundle->oauth.id_token;
     case ImportField::Account:
-        *capacity = sizeof(import_bundle->account_id);
-        return import_bundle->account_id;
+        *capacity = sizeof(upload_bundle->account_id);
+        return upload_bundle->account_id;
     }
     return nullptr;
 }
@@ -103,11 +103,11 @@ int token_begin_command(int argc, char **argv)
         printf("Usage: token-begin <codex|claude>\n");
         return 1;
     }
-    secure_clear(import_bundle, sizeof(*import_bundle));
+    secure_clear(upload_bundle, sizeof(*upload_bundle));
     secure_clear(field_lengths, sizeof(field_lengths));
-    import_provider = provider;
-    import_active = true;
-    printf("OK: token import started.\n");
+    upload_provider = provider;
+    upload_active = true;
+    printf("OK: token upload started.\n");
     return 0;
 }
 
@@ -115,7 +115,7 @@ int token_chunk_command(int argc, char **argv)
 {
     ImportField field;
     size_t offset;
-    if (argc != 4 || !import_active || !parse_field(argv[1], &field) || !parse_size(argv[2], &offset)) {
+    if (argc != 4 || !upload_active || !parse_field(argv[1], &field) || !parse_size(argv[2], &offset)) {
         if (argc == 4) secure_clear(argv[3], strlen(argv[3]));
         printf("ERROR: invalid token chunk.\n");
         return 1;
@@ -148,24 +148,25 @@ int token_chunk_command(int argc, char **argv)
 int token_commit_command(int argc, char **argv)
 {
     size_t expires_at;
-    if (argc != 2 || !import_active || !parse_size(argv[1], &expires_at) || expires_at > INT64_MAX) {
+    if (argc != 2 || !upload_active || !parse_size(argv[1], &expires_at) || expires_at > INT64_MAX) {
         printf("ERROR: invalid token commit.\n");
         return 1;
     }
 
     const time_t now = time(nullptr);
-    import_bundle->version = TokenBundle::VERSION;
-    import_bundle->expires_at = static_cast<int64_t>(expires_at);
-    import_bundle->refreshed_at = now;
-    const int64_t remaining = import_bundle->expires_at - now;
-    import_bundle->oauth.expires_in = remaining > UINT32_MAX ? UINT32_MAX : remaining > 0 ? remaining : 0;
+    upload_bundle->version = TokenBundle::VERSION;
+    upload_bundle->expires_at = static_cast<int64_t>(expires_at);
+    upload_bundle->refreshed_at = now;
+    const int64_t remaining = upload_bundle->expires_at - now;
+    upload_bundle->oauth.expires_in = remaining > UINT32_MAX ? UINT32_MAX : remaining > 0 ? remaining : 0;
 
-    const bool complete = import_bundle->oauth.access_token[0] && import_bundle->oauth.refresh_token[0] &&
-                          (import_provider != Provider::OpenAI || import_bundle->account_id[0]);
-    const esp_err_t result = complete ? token_store_save(import_provider, *import_bundle) : ESP_ERR_INVALID_ARG;
-    secure_clear(import_bundle, sizeof(*import_bundle));
+    const bool complete = upload_bundle->oauth.refresh_token[0] &&
+                          (upload_provider != Provider::OpenAI ||
+                           (upload_bundle->oauth.access_token[0] && upload_bundle->account_id[0]));
+    const esp_err_t result = complete ? token_store_save(upload_provider, *upload_bundle) : ESP_ERR_INVALID_ARG;
+    secure_clear(upload_bundle, sizeof(*upload_bundle));
     secure_clear(field_lengths, sizeof(field_lengths));
-    import_active = false;
+    upload_active = false;
     if (result != ESP_OK) {
         printf("ERROR: token bundle was not saved.\n");
         return 1;
@@ -234,15 +235,15 @@ void register_command(const char *name, const char *help, const char *hint, esp_
 
 void wifi_console_init()
 {
-    import_bundle = static_cast<TokenBundle *>(
+    upload_bundle = static_cast<TokenBundle *>(
         heap_caps_calloc(1, sizeof(TokenBundle), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!import_bundle) abort();
+    if (!upload_bundle) abort();
 
     register_command("connect", "Save Wi-Fi credentials and connect", "<SSID> <password>", connect_command);
-    register_command("token-begin", "Begin a local OAuth token import", "<codex|claude>", token_begin_command);
-    register_command("token-chunk", "Append an encoded OAuth token chunk", "<field> <offset> <base64url>",
+    register_command("token-begin", "Begin a local credential upload", "<codex|claude>", token_begin_command);
+    register_command("token-chunk", "Append an encoded credential chunk", "<field> <offset> <base64url>",
                      token_chunk_command);
-    register_command("token-commit", "Persist the imported OAuth token bundle", "<expires-at>", token_commit_command);
+    register_command("token-commit", "Persist the uploaded credential bundle", "<expires-at>", token_commit_command);
     register_command("status", "Show non-secret connection state", nullptr, status_command);
     register_command("restart", "Restart Quota Meter", nullptr, restart_command);
     ESP_ERROR_CHECK(esp_console_register_help_command());
