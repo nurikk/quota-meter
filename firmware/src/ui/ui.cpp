@@ -49,8 +49,6 @@ constexpr int COLUMN_GAP = 8;
 constexpr int BUTTON_HEIGHT = 44;
 constexpr int WIFI_QR_SIZE = 210;
 
-constexpr size_t MAX_CONNECTION_PAGES = 3;
-constexpr size_t MAX_QUOTA_BINDINGS = 6;
 constexpr size_t PAGE_NUMBER_TEXT_CAPACITY = 40;
 constexpr size_t COUNTDOWN_TEXT_CAPACITY = 20;
 constexpr size_t PERCENT_TEXT_CAPACITY = 16;
@@ -95,7 +93,7 @@ constexpr int COUNTDOWN_LETTER_SPACE = 2;
 constexpr int PROVIDER_LOGO_X = CONTENT_LEFT;
 constexpr int PROVIDER_LOGO_Y = 4;
 constexpr int PROVIDER_LOGO_SIZE = 48;
-constexpr int DASHBOARD_FOOTER_Y = SCREEN_HEIGHT - 14;
+constexpr int DASHBOARD_FOOTER_Y = SCREEN_HEIGHT - 16;
 constexpr int DASHBOARD_ZONE_WIDTH = 50;
 constexpr int DASHBOARD_FOOTER_X = 250;
 constexpr int DASHBOARD_FOOTER_WIDTH = CONTENT_RIGHT - DASHBOARD_FOOTER_X;
@@ -151,9 +149,8 @@ struct TileEntry {
 };
 
 lv_obj_t *root;
-TileEntry tiles[MAX_CONNECTION_PAGES];
-size_t tile_count;
-ConnectionPage active_page = ConnectionPage::Codex;
+std::vector<TileEntry> tiles;
+ConnectionPage active_page = IMPORT_PAGE;
 
 struct QuotaBinding {
     QuotaWindow window;
@@ -163,18 +160,7 @@ struct QuotaBinding {
     lv_obj_t *elapsed_caption;
 };
 
-QuotaBinding quota_bindings[MAX_QUOTA_BINDINGS];
-size_t quota_binding_count;
-
-const char *page_name(ConnectionPage page)
-{
-    switch (page) {
-    case ConnectionPage::Codex: return "Codex";
-    case ConnectionPage::Claude: return "Claude";
-    case ConnectionPage::Import: return "Import";
-    }
-    return "Unknown";
-}
+std::vector<QuotaBinding> quota_bindings;
 
 bool is_connected(const ProviderStatus &status)
 {
@@ -302,15 +288,13 @@ lv_obj_t *dashboard_bar(lv_obj_t *parent, int y, const char *prefix, float perce
 void add_quota_binding(const QuotaWindow *window, int window_minutes, lv_obj_t *countdown,
                        lv_obj_t *elapsed_bar = nullptr, lv_obj_t *elapsed_caption = nullptr)
 {
-    if (!window || quota_binding_count >= MAX_QUOTA_BINDINGS) return;
-    quota_bindings[quota_binding_count++] = {*window, window_minutes, countdown, elapsed_bar,
-                                              elapsed_caption};
+    if (!window) return;
+    quota_bindings.push_back({*window, window_minutes, countdown, elapsed_bar, elapsed_caption});
 }
 
 void update_quota_bindings(int64_t now)
 {
-    for (size_t index = 0; index < quota_binding_count; ++index) {
-        QuotaBinding &binding = quota_bindings[index];
+    for (auto &binding : quota_bindings) {
         char countdown[COUNTDOWN_TEXT_CAPACITY];
         format_countdown(binding.window.resets_at, now, countdown, sizeof(countdown));
         lv_label_set_text(binding.countdown, countdown);
@@ -407,9 +391,12 @@ void dashboard_footer(lv_obj_t *parent, const ProviderStatus &status)
     lv_obj_set_style_text_align(footer, LV_TEXT_ALIGN_RIGHT, 0);
 }
 
-void render_codex_dashboard(lv_obj_t *tile, const ProviderStatus &status)
+void render_codex_dashboard(lv_obj_t *tile, const Account &account, const ProviderStatus &status)
 {
     provider_marker(tile, &CODEX_LOGO);
+    lv_obj_t *name = dashboard_label(tile, account.name, QUOTA_PERIOD_X, 4, CONTENT_RIGHT - QUOTA_PERIOD_X,
+                                     &lv_font_montserrat_16, COLOR_CODEX);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_SCROLL_CIRCULAR);
     const QuotaWindow *primary = find_quota_window(status, "Primary");
     const QuotaWindow *secondary = find_quota_window(status, "Secondary");
     const QuotaWindow *top = find_quota_window_by_duration(status, FIVE_HOUR_WINDOW_MINUTES);
@@ -437,9 +424,13 @@ void render_codex_dashboard(lv_obj_t *tile, const ProviderStatus &status)
     dashboard_footer(tile, status);
 }
 
-void render_claude_dashboard(lv_obj_t *tile, const ProviderStatus &status)
+void render_claude_dashboard(lv_obj_t *tile, const Account &account, const ProviderStatus &status)
 {
     provider_marker(tile, &CLAUDE_LOGO);
+    lv_obj_t *name = dashboard_label(tile, account.name, QUOTA_PERIOD_X, DASHBOARD_FOOTER_Y,
+                                     DASHBOARD_FOOTER_X - QUOTA_PERIOD_X - 8,
+                                     &lv_font_montserrat_12, COLOR_CLAUDE);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_SCROLL_CIRCULAR);
     quota_block(tile, find_quota_window(status, "5 hour"), "5H", CLAUDE_PRIMARY_Y,
                 FIVE_HOUR_WINDOW_MINUTES, COLOR_CLAUDE);
     divider(tile, CLAUDE_FIRST_DIVIDER_Y);
@@ -527,13 +518,19 @@ void render_claude_dashboard(lv_obj_t *tile, const ProviderStatus &status)
     dashboard_footer(tile, status);
 }
 
-void render_expired_session(lv_obj_t *tile, Provider provider, size_t index, size_t count)
+void render_expired_session(lv_obj_t *tile, const Account &account, size_t index, size_t count)
 {
     lv_obj_t *view = column(tile);
-    label(view, provider == Provider::OpenAI ? "Codex" : "Claude", &lv_font_montserrat_20);
+    label(view, provider_name(account.provider), &lv_font_montserrat_16);
+    label(view, account.name, &lv_font_montserrat_20);
     label(view, "Credentials expired", &lv_font_montserrat_20);
-    label(view, "Reconnect USB and run firmware/tools/upload_tokens.py to replace them.",
+    label(view, "Reconnect USB and run firmware/tools/upload_tokens.py with:",
           &lv_font_montserrat_14, COLOR_SECONDARY);
+    label(view, "Choose --provider and --account with the exact name above.", &lv_font_montserrat_14);
+    if (account.provider == Provider::OpenAI) {
+        label(view, "Use --codex-auth PATH with a fresh device login (see firmware/README.md).",
+              &lv_font_montserrat_12, COLOR_SECONDARY);
+    }
     render_page_number(view, index, count);
 }
 
@@ -543,7 +540,7 @@ void render_import_page(lv_obj_t *tile, size_t index, size_t count)
     label(view, "USB token import", &lv_font_montserrat_20);
     label(view, "Connect this device to your computer, then run:",
           &lv_font_montserrat_14, COLOR_SECONDARY);
-    label(view, "python firmware/tools/upload_tokens.py", &lv_font_montserrat_16);
+    label(view, "python firmware/tools/upload_tokens.py\n--provider codex|claude --account NAME", &lv_font_montserrat_16);
     label(view, "Codex and Claude credentials are read locally and sent only over USB.",
           &lv_font_montserrat_12, COLOR_SECONDARY);
     render_page_number(view, index, count);
@@ -553,7 +550,7 @@ void tile_changed(lv_event_t *event)
 {
     lv_obj_t *tileview = static_cast<lv_obj_t *>(lv_event_get_current_target(event));
     lv_obj_t *active = lv_tileview_get_tile_active(tileview);
-    for (size_t index = 0; index < tile_count; ++index) {
+    for (size_t index = 0; index < tiles.size(); ++index) {
         if (tiles[index].tile == active) {
             active_page = tiles[index].page;
             return;
@@ -563,8 +560,9 @@ void tile_changed(lv_event_t *event)
 
 void render_carousel(const AppSnapshot &snapshot)
 {
-    ConnectionPage pages[MAX_CONNECTION_PAGES];
-    tile_count = connection_pages(snapshot, pages, MAX_CONNECTION_PAGES);
+    const auto pages = connection_pages(snapshot);
+    tiles.clear();
+    tiles.reserve(pages.size());
     lv_obj_t *tileview = lv_tileview_create(root);
     lv_obj_set_size(tileview, lv_pct(FULL_PERCENT), lv_pct(FULL_PERCENT));
     lv_obj_set_scrollbar_mode(tileview, LV_SCROLLBAR_MODE_OFF);
@@ -573,36 +571,33 @@ void render_carousel(const AppSnapshot &snapshot)
     lv_obj_set_style_pad_all(tileview, 0, 0);
 
     size_t selected = 0;
-    for (size_t index = 0; index < tile_count; ++index) {
+    for (size_t index = 0; index < pages.size(); ++index) {
         lv_dir_t direction = index == 0
                                  ? LV_DIR_RIGHT
-                                 : index + 1 == tile_count
+                                 : index + 1 == pages.size()
                                        ? LV_DIR_LEFT
                                        : static_cast<lv_dir_t>(LV_DIR_LEFT | LV_DIR_RIGHT);
-        lv_obj_t *tile = lv_tileview_add_tile(tileview, static_cast<uint8_t>(index), 0, direction);
+        lv_obj_t *tile = lv_tileview_add_tile(tileview, 0, 0, direction);
+        lv_obj_set_pos(tile, static_cast<int32_t>(index * SCREEN_WIDTH), 0);
         lv_obj_set_style_bg_opa(tile, LV_OPA_TRANSP, 0);
         lv_obj_set_scrollbar_mode(tile, LV_SCROLLBAR_MODE_OFF);
         lv_obj_remove_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_bg_opa(tile, LV_OPA_TRANSP, LV_PART_SCROLLBAR);
         lv_obj_set_style_border_width(tile, 0, 0);
         lv_obj_set_style_pad_all(tile, 0, 0);
-        tiles[index] = {pages[index], tile};
+        tiles.push_back({pages[index], tile});
         if (pages[index] == active_page) selected = index;
 
-        switch (pages[index]) {
-        case ConnectionPage::Codex:
-            if (snapshot.openai.auth == AuthState::Expired) render_expired_session(tile, Provider::OpenAI, index, tile_count);
-            else render_codex_dashboard(tile, snapshot.openai);
-            break;
-        case ConnectionPage::Claude:
-            if (snapshot.claude.auth == AuthState::Expired) render_expired_session(tile, Provider::Claude, index, tile_count);
-            else render_claude_dashboard(tile, snapshot.claude);
-            break;
-        case ConnectionPage::Import:
-            render_import_page(tile, index, tile_count);
-            break;
+        if (pages[index] == IMPORT_PAGE) {
+            render_import_page(tile, index, pages.size());
+        } else {
+            const auto *entry = snapshot.find(pages[index]);
+            if (entry->status.auth == AuthState::Expired) render_expired_session(tile, entry->account, index, pages.size());
+            else if (entry->account.provider == Provider::OpenAI) render_codex_dashboard(tile, entry->account, entry->status);
+            else render_claude_dashboard(tile, entry->account, entry->status);
         }
     }
+    lv_obj_update_layout(tileview);
 
     active_page = pages[selected];
     lv_tileview_set_tile(tileview, tiles[selected].tile, LV_ANIM_OFF);
@@ -626,7 +621,8 @@ void render_wifi(const AppSnapshot &snapshot)
 
 void render(const AppSnapshot &snapshot)
 {
-    quota_binding_count = 0;
+    quota_bindings.clear();
+    tiles.clear();
     lv_obj_clean(root);
     switch (select_screen(snapshot)) {
     case Screen::WifiSetup:
@@ -667,16 +663,11 @@ void ui_task(void *)
         vTaskDelay(pdMS_TO_TICKS(UI_REFRESH_INTERVAL_MS));
         AppSnapshot current = app_state_get();
         const int64_t current_second = static_cast<int64_t>(time(nullptr));
-        const bool state_changed = memcmp(&current, &previous, sizeof(current)) != 0;
+        const bool state_changed = current.revision != previous.revision;
         if (!state_changed && current_second == rendered_second) continue;
         if (bsp_display_lock(UI_UPDATE_LOCK_TIMEOUT_MS)) {
             if (state_changed) {
-                const ConnectionPage previous_page = active_page;
                 active_page = focus_after_usage_change(active_page, previous, current);
-                if (active_page != previous_page) {
-                    ESP_LOGI("quota_ui", "Active page changed %s -> %s", page_name(previous_page),
-                             page_name(active_page));
-                }
                 render(current);
             }
             else update_quota_bindings(current_second);

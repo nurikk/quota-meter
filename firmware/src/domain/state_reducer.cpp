@@ -5,9 +5,11 @@ Screen select_screen(const AppSnapshot &state)
 {
     if (state.hardware_error) return Screen::FatalHardwareError;
     if (state.wifi != WifiState::Connected) return Screen::WifiSetup;
-    if (state.openai.auth == AuthState::Authenticated || state.claude.auth == AuthState::Authenticated ||
-        state.openai.auth == AuthState::Refreshing || state.claude.auth == AuthState::Refreshing ||
-        state.openai.auth == AuthState::Expired || state.claude.auth == AuthState::Expired) return Screen::Dashboard;
+    for (const auto &entry : state.accounts) {
+        const AuthState auth = entry.status.auth;
+        if (auth == AuthState::Authenticated || auth == AuthState::Refreshing || auth == AuthState::Expired)
+            return Screen::Dashboard;
+    }
     return Screen::TokenImport;
 }
 

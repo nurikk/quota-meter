@@ -24,17 +24,14 @@ static bool is_connected(const ProviderStatus &status)
     return status.auth == AuthState::Authenticated || status.auth == AuthState::Refreshing;
 }
 
-size_t connection_pages(const AppSnapshot &snapshot, ConnectionPage *pages, size_t capacity)
+std::vector<ConnectionPage> connection_pages(const AppSnapshot &snapshot)
 {
-    ConnectionPage ordered[3];
-    size_t count = 0;
-    if (is_connected(snapshot.openai) || snapshot.openai.auth == AuthState::Expired) ordered[count++] = ConnectionPage::Codex;
-    if (is_connected(snapshot.claude) || snapshot.claude.auth == AuthState::Expired) ordered[count++] = ConnectionPage::Claude;
-    ordered[count++] = ConnectionPage::Import;
-
-    const size_t copied = count < capacity ? count : capacity;
-    for (size_t index = 0; index < copied; ++index) pages[index] = ordered[index];
-    return count;
+    std::vector<ConnectionPage> pages;
+    for (const auto &entry : snapshot.accounts) {
+        if (is_connected(entry.status) || entry.status.auth == AuthState::Expired) pages.push_back(entry.account.id);
+    }
+    pages.push_back(IMPORT_PAGE);
+    return pages;
 }
 
 static bool same_label(const char *left, const char *right)
@@ -98,21 +95,24 @@ static bool quota_updated(const ProviderStatus &before, const ProviderStatus &af
 ConnectionPage focus_after_usage_change(ConnectionPage current, const AppSnapshot &previous,
                                         const AppSnapshot &current_snapshot)
 {
-    if (current_snapshot.openai.auth == AuthState::Expired && previous.openai.auth != AuthState::Expired)
-        return ConnectionPage::Codex;
-    if (current_snapshot.claude.auth == AuthState::Expired && previous.claude.auth != AuthState::Expired)
-        return ConnectionPage::Claude;
-    if ((current == ConnectionPage::Codex && current_snapshot.openai.auth == AuthState::Expired) ||
-        (current == ConnectionPage::Claude && current_snapshot.claude.auth == AuthState::Expired)) return current;
-    if (current == ConnectionPage::Import) return current;
-    const bool openai_updated = quota_updated(previous.openai, current_snapshot.openai);
-    const bool claude_updated = quota_updated(previous.claude, current_snapshot.claude);
-    if (!openai_updated && !claude_updated) return current;
-    if (openai_updated && claude_updated) {
-        return current_snapshot.claude.fetched_at > current_snapshot.openai.fetched_at
-                   ? ConnectionPage::Claude : ConnectionPage::Codex;
+    for (const auto &entry : current_snapshot.accounts) {
+        const auto *before = previous.find(entry.account.id);
+        if (entry.status.auth == AuthState::Expired && (!before || before->status.auth != AuthState::Expired))
+            return entry.account.id;
     }
-    return openai_updated ? ConnectionPage::Codex : ConnectionPage::Claude;
+    const auto *active = current_snapshot.find(current);
+    if (active && active->status.auth == AuthState::Expired) return current;
+    if (current == IMPORT_PAGE) return current;
+    ConnectionPage next = current;
+    int64_t latest = 0;
+    for (const auto &entry : current_snapshot.accounts) {
+        const auto *before = previous.find(entry.account.id);
+        if (quota_updated(before ? before->status : ProviderStatus{}, entry.status) && entry.status.fetched_at > latest) {
+            next = entry.account.id;
+            latest = entry.status.fetched_at;
+        }
+    }
+    return next;
 }
 
 float elapsed_percent(const QuotaWindow &window, int64_t now, int window_minutes)

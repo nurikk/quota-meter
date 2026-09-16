@@ -211,15 +211,17 @@ static esp_err_t js_handler(httpd_req_t *request)
 }
 static const char *auth_name(AuthState state) { const char *names[] = {"signed_out","authenticated","refreshing","error","expired"}; size_t value = static_cast<size_t>(state); return value < sizeof(names) / sizeof(names[0]) ? names[value] : "error"; }
 static const char *quota_name(QuotaState state) { const char *names[] = {"idle","loading","fresh","stale","error"}; size_t value = static_cast<size_t>(state); return value < 5 ? names[value] : "error"; }
-static void provider_json(cJSON *root, const char *name, const ProviderStatus &status)
+static void provider_json(cJSON *accounts, const Account &account, const ProviderStatus &status)
 {
     cJSON *provider = cJSON_CreateObject(); cJSON_AddStringToObject(provider, "auth", auth_name(status.auth)); cJSON_AddStringToObject(provider, "quota", quota_name(status.quota)); cJSON_AddStringToObject(provider, "plan", status.plan);
-    cJSON_AddNumberToObject(provider, "window_count", status.window_count); cJSON_AddNumberToObject(provider, "fetched_at", static_cast<double>(status.fetched_at)); cJSON_AddItemToObject(root, name, provider);
+    cJSON_AddNumberToObject(provider, "window_count", status.window_count); cJSON_AddNumberToObject(provider, "fetched_at", static_cast<double>(status.fetched_at)); cJSON_AddStringToObject(provider, "provider", provider_name(account.provider)); cJSON_AddStringToObject(provider, "name", account.name); cJSON_AddItemToArray(accounts, provider);
 }
 static esp_err_t status_handler(httpd_req_t *request)
 {
     AppSnapshot snapshot = app_state_get(); cJSON *root = cJSON_CreateObject(); cJSON_AddNumberToObject(root, "wifi", static_cast<int>(snapshot.wifi)); cJSON_AddStringToObject(root, "ip", snapshot.sta_ip);
-    provider_json(root, "openai", snapshot.openai); provider_json(root, "claude", snapshot.claude); char *text = cJSON_PrintUnformatted(root); cJSON_Delete(root); if (!text) return ESP_FAIL;
+    cJSON *accounts = cJSON_AddArrayToObject(root, "accounts");
+    for (const auto &entry : snapshot.accounts) provider_json(accounts, entry.account, entry.status);
+    char *text = cJSON_PrintUnformatted(root); cJSON_Delete(root); if (!text) return ESP_FAIL;
     httpd_resp_set_type(request, "application/json"); httpd_resp_set_hdr(request, "Cache-Control", "no-store"); esp_err_t result = httpd_resp_sendstr(request, text); cJSON_free(text); return result;
 }
 static esp_err_t scan_handler(httpd_req_t *request)

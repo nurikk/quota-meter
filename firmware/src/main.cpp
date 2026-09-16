@@ -25,10 +25,6 @@ static void start_task(TaskFunction_t task, const char *name, uint32_t stack_siz
 extern "C" void app_main(void)
 {
     esp_err_t result = nvs_flash_init();
-    if (result == ESP_ERR_NVS_NO_FREE_PAGES || result == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        result = nvs_flash_init();
-    }
     ESP_ERROR_CHECK(result);
     qm::configure_london_timezone();
     ESP_ERROR_CHECK(esp_netif_init());

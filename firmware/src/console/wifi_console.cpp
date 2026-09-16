@@ -1,4 +1,5 @@
 #include "wifi_console.h"
+#include "token_upload.h"
 #ifdef ESP_PLATFORM
 #include "../app/app_state.h"
 #include "../auth/token_store.h"
@@ -20,24 +21,11 @@ namespace qm {
 namespace {
 
 TokenBundle *upload_bundle;
-Provider upload_provider;
+Account upload_account;
 bool upload_active;
 size_t field_lengths[4];
 
 enum class ImportField : uint8_t { Access, Refresh, Id, Account };
-
-bool parse_provider(const char *value, Provider *provider)
-{
-    if (strcmp(value, "codex") == 0) {
-        *provider = Provider::OpenAI;
-        return true;
-    }
-    if (strcmp(value, "claude") == 0) {
-        *provider = Provider::Claude;
-        return true;
-    }
-    return false;
-}
 
 bool parse_field(const char *value, ImportField *field)
 {
@@ -98,14 +86,16 @@ int connect_command(int argc, char **argv)
 
 int token_begin_command(int argc, char **argv)
 {
-    Provider provider;
-    if (argc != 2 || !parse_provider(argv[1], &provider)) {
-        printf("Usage: token-begin <codex|claude>\n");
-        return 1;
-    }
     secure_clear(upload_bundle, sizeof(*upload_bundle));
     secure_clear(field_lengths, sizeof(field_lengths));
-    upload_provider = provider;
+    upload_active = false;
+    Account account;
+    if (argc != 3 ||
+        !parse_upload_account(argv[1], argv[2], &account)) {
+        printf("ERROR: usage: token-begin <codex|claude> <base64url-name>\n");
+        return 1;
+    }
+    upload_account = account;
     upload_active = true;
     printf("OK: token upload started.\n");
     return 0;
@@ -161,23 +151,24 @@ int token_commit_command(int argc, char **argv)
     upload_bundle->oauth.expires_in = remaining > UINT32_MAX ? UINT32_MAX : remaining > 0 ? remaining : 0;
 
     const bool complete = upload_bundle->oauth.refresh_token[0] &&
-                          (upload_provider != Provider::OpenAI ||
+                          (upload_account.provider != Provider::OpenAI ||
                            (upload_bundle->oauth.access_token[0] && upload_bundle->account_id[0]));
-    const esp_err_t result = complete ? token_store_save(upload_provider, *upload_bundle) : ESP_ERR_INVALID_ARG;
+    const esp_err_t result = complete ? token_store_upload(upload_account.provider, upload_account.name, *upload_bundle) : ESP_ERR_INVALID_ARG;
     secure_clear(upload_bundle, sizeof(*upload_bundle));
     secure_clear(field_lengths, sizeof(field_lengths));
     upload_active = false;
     if (result != ESP_OK) {
-        printf("ERROR: token bundle was not saved.\n");
+        printf("ERROR: token bundle was not saved (%s).\n", esp_err_to_name(result));
         return 1;
     }
     printf("OK: token bundle saved.\n");
     return 0;
 }
 
-void print_provider_status(const char *name, const ProviderStatus &status)
+void print_provider_status(const Account &account, const ProviderStatus &status)
 {
-    printf("%s auth=%u quota=%u error=%u plan=%s windows=%u fetched=%lld\n", name,
+    printf("%s - %s auth=%u quota=%u error=%u plan=%s windows=%u fetched=%lld\n",
+           provider_name(account.provider), account.name,
            static_cast<unsigned>(status.auth), static_cast<unsigned>(status.quota),
            static_cast<unsigned>(status.error), status.plan[0] ? status.plan : "--",
            status.window_count, static_cast<long long>(status.fetched_at));
@@ -201,8 +192,7 @@ int status_command(int argc, char **)
     const AppSnapshot snapshot = app_state_get();
     printf("Wi-Fi state=%u ip=%s time=%lld\n", static_cast<unsigned>(snapshot.wifi), snapshot.sta_ip,
            static_cast<long long>(time(nullptr)));
-    print_provider_status("Codex", snapshot.openai);
-    print_provider_status("Claude", snapshot.claude);
+    for (const auto &entry : snapshot.accounts) print_provider_status(entry.account, entry.status);
     return 0;
 }
 
@@ -215,6 +205,21 @@ int restart_command(int argc, char **)
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
     return 0;
+}
+
+int accounts_clear_command(int argc, char **)
+{
+    if (argc != 1) return 1;
+    const esp_err_t result = token_store_clear();
+    if (result != ESP_OK) {
+        printf("ERROR: could not clear all account data (%d).\n", result);
+        return 1;
+    }
+    upload_active = false;
+    secure_clear(upload_bundle, sizeof(*upload_bundle));
+    secure_clear(field_lengths, sizeof(field_lengths));
+    printf("OK: all accounts cleared. Wi-Fi preserved.\n");
+    return restart_command(1, nullptr);
 }
 
 void register_command(const char *name, const char *help, const char *hint, esp_console_cmd_func_t function)
@@ -240,11 +245,12 @@ void wifi_console_init()
     if (!upload_bundle) abort();
 
     register_command("connect", "Save Wi-Fi credentials and connect", "<SSID> <password>", connect_command);
-    register_command("token-begin", "Begin a local credential upload", "<codex|claude>", token_begin_command);
+    register_command("token-begin", "Begin a local credential upload", "<codex|claude> <base64url-name>", token_begin_command);
     register_command("token-chunk", "Append an encoded credential chunk", "<field> <offset> <base64url>",
                      token_chunk_command);
     register_command("token-commit", "Persist the uploaded credential bundle", "<expires-at>", token_commit_command);
     register_command("status", "Show non-secret connection state", nullptr, status_command);
+    register_command("accounts-clear", "Delete all provider accounts and cached quotas, keep Wi-Fi, then restart", nullptr, accounts_clear_command);
     register_command("restart", "Restart Quota Meter", nullptr, restart_command);
     ESP_ERROR_CHECK(esp_console_register_help_command());
 

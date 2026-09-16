@@ -4,12 +4,13 @@
 #include "../domain/models.h"
 namespace qm {
 
-enum class ConnectionPage : uint8_t { Codex, Claude, Import };
+using ConnectionPage = AccountId;
+constexpr ConnectionPage IMPORT_PAGE = 0;
 enum class UsageRisk : uint8_t { Normal, Warning, High };
 enum class FooterTone : uint8_t { Normal, Warning, Error };
 
 void format_provider_summary(const ProviderStatus &status, char *output, size_t output_len);
-size_t connection_pages(const AppSnapshot &snapshot, ConnectionPage *pages, size_t capacity);
+std::vector<ConnectionPage> connection_pages(const AppSnapshot &snapshot);
 const QuotaWindow *find_quota_window(const ProviderStatus &status, const char *semantic_label);
 const QuotaWindow *find_model_limit(const ProviderStatus &status, const char *preferred_label);
 const QuotaWindow *find_quota_window_by_duration(const ProviderStatus &status, int32_t window_minutes);

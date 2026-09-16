@@ -1,6 +1,9 @@
 import base64
+import hashlib
 import json
+import subprocess
 import sys
+import unicodedata
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,7 +37,7 @@ def test_reads_sanitized_desktop_token_shapes(tmp_path: Path) -> None:
             }
         )
     )
-    codex = upload_tokens.read_codex_tokens(codex_path)
+    codex = upload_tokens.read_codex_tokens(codex_path, "Work Team")
     assert codex.provider == "codex"
     assert codex.expires_at == 2_000_000_000
     assert codex.account_id == "account-1"
@@ -48,7 +51,7 @@ def test_reads_sanitized_desktop_token_shapes(tmp_path: Path) -> None:
                     "expiresAt": 2_000_000_000_000,
                 }
             }
-        )
+        ), "Research"
     )
     assert claude.provider == "claude"
     assert claude.expires_at == 2_000_000_000
@@ -63,7 +66,7 @@ def test_reads_sanitized_desktop_token_shapes(tmp_path: Path) -> None:
                     "expiresAt": 0,
                 }
             }
-        )
+        ), "Research"
     )
     assert stale_claude.access_token == ""
     assert stale_claude.expires_at == 0
@@ -127,60 +130,131 @@ def test_claude_credentials_fall_back_to_config_file(
     )
 
 
-def test_discovery_order_is_codex_then_claude(monkeypatch: pytest.MonkeyPatch) -> None:
-    codex = upload_tokens.TokenSource("codex", "a", "r", "i", "account", 1)
-    claude = upload_tokens.TokenSource("claude", "a", "r", "", "", 1)
-    monkeypatch.setattr(upload_tokens, "codex_auth_path", lambda: Path("auth.json"))
-    monkeypatch.setattr(upload_tokens, "read_codex_tokens", lambda _path: codex)
-    monkeypatch.setattr(upload_tokens, "claude_credentials_text", lambda: "{}")
-    monkeypatch.setattr(upload_tokens, "read_claude_tokens", lambda _text: claude)
-    assert [source.provider for source in upload_tokens.discover_tokens()] == [
-        "codex",
-        "claude",
-    ]
-
-
-def test_discovery_honors_provider_and_path_overrides(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("config_dir", [None, "", "~/device-work", "/device/Café", "/device/Cafe\u0301"])
+def test_claude_keychain_service_uses_exact_selected_directory(
+    monkeypatch: pytest.MonkeyPatch, config_dir: str | None,
 ) -> None:
+    commands: list[list[str]] = []
+
+    def security_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="synthetic-credentials")
+
+    monkeypatch.setattr(upload_tokens.shutil, "which", lambda _name: "/usr/bin/security")
+    monkeypatch.setattr(upload_tokens.subprocess, "run", security_run)
+    environment = {} if config_dir is None else {"CLAUDE_CONFIG_DIR": config_dir}
+    assert upload_tokens.claude_credentials_text(environment, platform="darwin") == "synthetic-credentials"
+    expected = "Claude Code-credentials"
+    if config_dir:
+        expected += "-" + hashlib.sha256(unicodedata.normalize("NFC", config_dir).encode()).hexdigest()[:8]
+    assert commands == [["/usr/bin/security", "find-generic-password", "-s", expected, "-w"]]
+
+
+def test_custom_claude_keychain_failure_only_uses_selected_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+    (tmp_path / ".credentials.json").write_text("selected-account")
+
+    def security_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 1, stdout="")
+
+    monkeypatch.setattr(upload_tokens.shutil, "which", lambda _name: "/usr/bin/security")
+    monkeypatch.setattr(upload_tokens.subprocess, "run", security_run)
+    assert upload_tokens.claude_credentials_text({"CLAUDE_CONFIG_DIR": str(tmp_path)}, "darwin") == "selected-account"
+    assert len(commands) == 1
+    assert commands[0][3].startswith("Claude Code-credentials-")
+
+
+@pytest.fixture
+def credential_files(tmp_path: Path) -> tuple[Path, Path]:
     codex_path = tmp_path / "codex.json"
+    codex_path.write_text(json.dumps({"tokens": {
+        "access_token": jwt({"exp": 2_000_000_000}),
+        "refresh_token": "synthetic-refresh", "id_token": "synthetic-id",
+        "account_id": "synthetic-provider-id",
+    }}))
     claude_path = tmp_path / "claude.json"
-    claude_path.write_text("claude")
-    codex = upload_tokens.TokenSource("codex", "a", "r", "i", "account", 2)
-    claude = upload_tokens.TokenSource("claude", "a", "r", "", "", 2)
-    monkeypatch.setattr(upload_tokens, "read_codex_tokens", lambda path: codex if path == codex_path else None)
-    monkeypatch.setattr(upload_tokens, "read_claude_tokens", lambda text: claude if text == "claude" else None)
-
-    assert upload_tokens.discover_tokens("codex", codex_path) == [codex]
-    assert upload_tokens.discover_tokens("claude", claude_path=claude_path) == [claude]
+    claude_path.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "synthetic-access", "refreshToken": "synthetic-refresh",
+        "expiresAt": 0,
+    }}))
+    return codex_path, claude_path
 
 
-def test_discovery_accepts_stale_tokens_for_device_refresh(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+@pytest.mark.parametrize("account", ["Work Team", "Research", "Bluefish", "Personal", "x" * 32, "quoted '\"; name"])
+def test_discovery_honors_provider_name_and_explicit_file(
+    credential_files: tuple[Path, Path], provider: str, account: str,
 ) -> None:
-    stale = upload_tokens.TokenSource("codex", "a", "r", "i", "account", 10)
-    monkeypatch.setattr(upload_tokens, "read_codex_tokens", lambda _path: stale)
-    assert upload_tokens.discover_tokens("codex", Path("auth.json")) == [stale]
+    codex_path, claude_path = credential_files
+    sources = upload_tokens.discover_tokens(
+        provider, account,
+        codex_path=codex_path if provider == "codex" else None,
+        claude_path=claude_path if provider == "claude" else None,
+    )
+    assert len(sources) == 1
+    assert sources[0].provider == provider
+    assert sources[0].account == account
+    command = upload_tokens.token_begin_command(sources[0])
+    verb, encoded_provider, encoded_name = command.rstrip().split(b" ")
+    assert verb == b"token-begin"
+    assert encoded_provider.decode() == provider
+    assert base64.urlsafe_b64decode(encoded_name + b"=" * (-len(encoded_name) % 4)).decode() == account
+    assert command.count(b"\n") == 1
+    assert len(command) < 256
 
 
-def test_discovery_rejects_oversized_tokens(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+@pytest.mark.parametrize("account", [None, "", " ", " Work", "Work ", "x" * 33, "A\nrestart", "A\rB", "A\0B", "A\tB", "A\x7fB", "Café"])
+def test_invalid_account_selection_does_not_read_credentials(
+    monkeypatch: pytest.MonkeyPatch, provider: str, account: str | None,
 ) -> None:
-    oversized = upload_tokens.TokenSource("codex", "a" * 4097, "r", "i", "account", 20)
-    monkeypatch.setattr(upload_tokens, "read_codex_tokens", lambda _path: oversized)
+    def unexpected_read(*_args: object) -> None:
+        pytest.fail("Invalid selection must not read credentials")
+
+    monkeypatch.setattr(upload_tokens, "read_codex_tokens", unexpected_read)
+    monkeypatch.setattr(upload_tokens, "claude_credentials_text", unexpected_read)
+    with pytest.raises(ValueError, match="Account name"):
+        upload_tokens.discover_tokens(provider=provider, account=account)
+
+
+@pytest.mark.parametrize("provider", ["all", "unknown", ""])
+def test_invalid_provider_selection(provider: str) -> None:
+    with pytest.raises(ValueError, match="Provider"):
+        upload_tokens.discover_tokens(provider, "Work")
+
+
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+def test_mismatched_file_rejected_before_reading(provider: str) -> None:
+    with pytest.raises(ValueError, match="requires --provider"):
+        upload_tokens.discover_tokens(
+            provider, "Work", codex_path=Path("missing") if provider == "claude" else None,
+            claude_path=Path("missing") if provider == "codex" else None,
+        )
+
+
+def test_discovery_rejects_oversized_tokens(credential_files: tuple[Path, Path]) -> None:
+    codex_path, _ = credential_files
+    data = json.loads(codex_path.read_text())
+    data["tokens"]["access_token"] = jwt({"exp": 20, "padding": "x" * 4097})
+    codex_path.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="access token is invalid"):
-        upload_tokens.discover_tokens("codex", Path("auth.json"))
+        upload_tokens.discover_tokens("codex", "Work", codex_path)
 
 
 def test_token_source_repr_does_not_expose_credentials() -> None:
     source = upload_tokens.TokenSource(
-        "codex", "secret-access", "secret-refresh", "secret-id", "account", 1
+        "codex", "Work Team", "secret-access", "secret-refresh", "secret-id", "account", 1
     )
     assert "secret" not in repr(source)
 
 
-def test_send_tokens_uploads_in_order_and_restarts(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("account_count", [1, 10, 11])
+@pytest.mark.parametrize("providers", [("codex",), ("claude",), ("codex", "claude")])
+def test_send_tokens_uploads_independent_accounts_and_restarts(
+    monkeypatch: pytest.MonkeyPatch, account_count: int, providers: tuple[str, ...],
 ) -> None:
     class Connection:
         def __init__(self) -> None:
@@ -228,8 +302,8 @@ def test_send_tokens_uploads_in_order_and_restarts(
     serial = SimpleNamespace(Serial=lambda **_kwargs: connection)
     monkeypatch.setattr(upload_tokens.importlib, "import_module", lambda _name: serial)
     sources = [
-        upload_tokens.TokenSource("codex", "access", "refresh", "id", "account", 1),
-        upload_tokens.TokenSource("claude", "access", "refresh", "", "", 2),
+        upload_tokens.TokenSource(provider, f"Account {index}", "access", "refresh", "id", "account", 1)
+        for provider in providers for index in range(account_count)
     ]
 
     upload_tokens.send_tokens("target", sources)
@@ -237,5 +311,39 @@ def test_send_tokens_uploads_in_order_and_restarts(
     begins = [
         command for command in connection.commands if command.startswith(b"token-begin")
     ]
-    assert begins == [b"token-begin codex\r\n", b"token-begin claude\r\n"]
+    expected = [bytes(upload_tokens.token_begin_command(source)) for source in sources]
+    assert begins == expected
     assert connection.commands[-1] == b"restart\r\n"
+
+
+@pytest.mark.parametrize("invalid_bundle", [False, True])
+def test_main_rejects_invalid_upload_before_loading_serial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_bundle: bool,
+) -> None:
+    path = tmp_path / "auth.json"
+    path.write_text("{}")
+    args = ["upload_tokens.py", "--provider", "codex" if invalid_bundle else "claude",
+            "--account", "Work", "--codex-auth", str(path)]
+    monkeypatch.setattr(sys, "argv", args)
+
+    def unexpected_import(_name: str) -> None:
+        pytest.fail("Invalid upload must not load serial")
+
+    monkeypatch.setattr(upload_tokens.importlib, "import_module", unexpected_import)
+    assert upload_tokens.main() == 1
+
+
+def test_send_tokens_validates_every_bundle_before_opening_serial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sources = [
+        upload_tokens.TokenSource("codex", "Work Team", "a", "r", "i", "account", 1),
+        upload_tokens.TokenSource("codex", "Other", "a", "", "i", "account", 1),
+    ]
+
+    def unexpected_import(_name: str) -> None:
+        pytest.fail("Invalid upload must not load serial")
+
+    monkeypatch.setattr(upload_tokens.importlib, "import_module", unexpected_import)
+    with pytest.raises(ValueError, match="refresh token is missing"):
+        upload_tokens.send_tokens("target", sources)

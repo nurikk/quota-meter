@@ -2,6 +2,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <vector>
 
 namespace qm {
 
@@ -10,6 +13,28 @@ enum class AuthState : uint8_t { SignedOut, Authenticated, Refreshing, Error, Ex
 enum class QuotaState : uint8_t { Idle, Loading, Fresh, Stale, Error };
 enum class Screen : uint8_t { WifiSetup, TokenImport, Dashboard, FatalHardwareError };
 enum class Provider : uint8_t { OpenAI, Claude };
+using AccountId = uint32_t;
+constexpr size_t ACCOUNT_NAME_CAPACITY = 33;
+struct Account {
+    AccountId id{};
+    Provider provider{};
+    char name[ACCOUNT_NAME_CAPACITY]{};
+    uint32_t generation{};
+};
+inline bool valid_account_name(const char *name)
+{
+    const size_t length = strnlen(name, ACCOUNT_NAME_CAPACITY);
+    if (!length || length >= ACCOUNT_NAME_CAPACITY || name[0] == ' ' || name[length - 1] == ' ') return false;
+    for (size_t i = 0; i < length; ++i) {
+        if (static_cast<unsigned char>(name[i]) < 32 || static_cast<unsigned char>(name[i]) > 126) return false;
+    }
+    return true;
+}
+inline bool same_account_target(const Account &account, Provider provider, const char *name)
+{
+    return account.provider == provider && strcmp(account.name, name) == 0;
+}
+inline const char *provider_name(Provider provider) { return provider == Provider::OpenAI ? "codex" : "claude"; }
 enum class ErrorCode : uint8_t { None, Network, InvalidResponse, Unauthorized, Forbidden, Throttled, Storage };
 
 struct QuotaWindow {
@@ -57,14 +82,36 @@ struct ProviderStatus {
     int64_t fetched_at;
 };
 
+struct AccountStatus {
+    Account account;
+    ProviderStatus status{};
+};
+
 struct AppSnapshot {
-    WifiState wifi;
-    ProviderStatus openai;
-    ProviderStatus claude;
-    bool hardware_error;
-    char ap_ssid[33];
-    char ap_password[16];
-    char sta_ip[16];
+    uint64_t revision{};
+    WifiState wifi{};
+    std::vector<AccountStatus> accounts;
+    bool hardware_error{};
+    char ap_ssid[33]{};
+    char ap_password[16]{};
+    char sta_ip[16]{};
+
+    const AccountStatus *find(AccountId id) const
+    {
+        for (const auto &entry : accounts) if (entry.account.id == id) return &entry;
+        return nullptr;
+    }
+    ProviderStatus &status(AccountId id)
+    {
+        for (auto &entry : accounts) if (entry.account.id == id) return entry.status;
+        abort();
+    }
+    const ProviderStatus &status(AccountId id) const
+    {
+        const auto *entry = find(id);
+        if (!entry) abort();
+        return entry->status;
+    }
 };
 
 struct HttpResult {

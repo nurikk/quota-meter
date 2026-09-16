@@ -5,6 +5,9 @@
 #include <time.h>
 #include <initializer_list>
 #include "domain/state_reducer.h"
+#include "auth/token_store.h"
+#include <memory>
+#include "console/token_upload.h"
 #include "net/http_client.h"
 #include "portal/portal_logic.h"
 #include "providers/claude_protocol.h"
@@ -201,10 +204,21 @@ static void test_reducer_and_portal_helpers()
     TEST_ASSERT_TRUE(same_origin("http://192.168.4.1", "192.168.4.1")); TEST_ASSERT_FALSE(same_origin("http://evil/", "192.168.4.1"));
     TEST_ASSERT_TRUE(constant_time_equal("password", "password")); TEST_ASSERT_FALSE(constant_time_equal("password", "Password"));
 }
+static AppSnapshot sample_accounts(size_t count = 3)
+{
+    AppSnapshot snapshot{};
+    for (size_t index = 0; index < count; ++index) {
+        Account account{static_cast<AccountId>(index + 1), index % 2 ? Provider::Claude : Provider::OpenAI, {}, 1};
+        snprintf(account.name, sizeof(account.name), "Account %zu", index / 2 + 1);
+        snapshot.accounts.push_back({account, {}});
+    }
+    return snapshot;
+}
+
 static void assert_pages(const AppSnapshot &state, const ConnectionPage *expected, size_t expected_count)
 {
-    ConnectionPage actual[3];
-    TEST_ASSERT_EQUAL_size_t(expected_count, connection_pages(state, actual, 3));
+    const auto actual = connection_pages(state);
+    TEST_ASSERT_EQUAL_size_t(expected_count, actual.size());
     for (size_t index = 0; index < expected_count; ++index) {
         TEST_ASSERT_EQUAL_INT(static_cast<int>(expected[index]), static_cast<int>(actual[index]));
     }
@@ -212,69 +226,69 @@ static void assert_pages(const AppSnapshot &state, const ConnectionPage *expecte
 
 static void test_usage_change_focus_policy()
 {
-    AppSnapshot before{};
-    before.openai.quota = QuotaState::Fresh;
-    before.openai.window_count = 1;
-    before.openai.windows[0] = {"Primary", 10, 1000, true};
-    before.openai.fetched_at = 1000;
-    before.claude.quota = QuotaState::Fresh;
-    before.claude.window_count = 1;
-    before.claude.windows[0] = {"5 hour", 20, 2000, true};
-    before.claude.fetched_at = 2000;
+    AppSnapshot before = sample_accounts();
+    before.status(1).quota = QuotaState::Fresh;
+    before.status(1).window_count = 1;
+    before.status(1).windows[0] = {"Primary", 10, 1000, true};
+    before.status(1).fetched_at = 1000;
+    before.status(2).quota = QuotaState::Fresh;
+    before.status(2).window_count = 1;
+    before.status(2).windows[0] = {"5 hour", 20, 2000, true};
+    before.status(2).fetched_at = 2000;
 
     AppSnapshot after = before;
-    after.claude.fetched_at = 3000;
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(ConnectionPage::Claude),
-                          static_cast<int>(focus_after_usage_change(ConnectionPage::Codex, before, after)));
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(ConnectionPage::Import),
-                          static_cast<int>(focus_after_usage_change(ConnectionPage::Import, before, after)));
+    after.status(2).fetched_at = 3000;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(2),
+                          static_cast<int>(focus_after_usage_change(1, before, after)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(IMPORT_PAGE),
+                          static_cast<int>(focus_after_usage_change(IMPORT_PAGE, before, after)));
 
     after = before;
-    after.claude.windows[0].resets_at = 3000;
-    after.claude.windows[0].used_percent = 21;
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(ConnectionPage::Codex),
-                          static_cast<int>(focus_after_usage_change(ConnectionPage::Codex, before, after)));
+    after.status(2).windows[0].resets_at = 3000;
+    after.status(2).windows[0].used_percent = 21;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(1),
+                          static_cast<int>(focus_after_usage_change(1, before, after)));
 
-    AppSnapshot initial{};
-    initial.openai.quota = QuotaState::Fresh;
-    initial.openai.window_count = 1;
-    initial.openai.windows[0] = {"Primary", 10, 1000, true};
-    initial.openai.fetched_at = 1000;
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(ConnectionPage::Codex),
-                          static_cast<int>(focus_after_usage_change(ConnectionPage::Claude, AppSnapshot{}, initial)));
-    initial.openai.quota = QuotaState::Stale;
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(ConnectionPage::Claude),
-                          static_cast<int>(focus_after_usage_change(ConnectionPage::Claude, AppSnapshot{}, initial)));
+    AppSnapshot initial = sample_accounts();
+    initial.status(1).quota = QuotaState::Fresh;
+    initial.status(1).window_count = 1;
+    initial.status(1).windows[0] = {"Primary", 10, 1000, true};
+    initial.status(1).fetched_at = 1000;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(1),
+                          static_cast<int>(focus_after_usage_change(2, AppSnapshot{}, initial)));
+    initial.status(1).quota = QuotaState::Stale;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(2),
+                          static_cast<int>(focus_after_usage_change(2, AppSnapshot{}, initial)));
 
     after = before;
-    after.openai.fetched_at = 4000;
-    after.claude.fetched_at = 3000;
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(ConnectionPage::Codex),
-                          static_cast<int>(focus_after_usage_change(ConnectionPage::Claude, before, after)));
+    after.status(1).fetched_at = 4000;
+    after.status(2).fetched_at = 3000;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(1),
+                          static_cast<int>(focus_after_usage_change(2, before, after)));
 
-    before.claude.fetched_at = 5000;
+    before.status(2).fetched_at = 5000;
     after = before;
-    after.claude.fetched_at = 3000;
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(ConnectionPage::Claude),
-                          static_cast<int>(focus_after_usage_change(ConnectionPage::Codex, before, after)));
+    after.status(2).fetched_at = 3000;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(2),
+                          static_cast<int>(focus_after_usage_change(1, before, after)));
 }
 
 static void test_connection_page_order()
 {
-    AppSnapshot state{};
-    const ConnectionPage none[] = {ConnectionPage::Import};
+    AppSnapshot state = sample_accounts();
+    const ConnectionPage none[] = {IMPORT_PAGE};
     assert_pages(state, none, 1);
 
-    state.claude.auth = AuthState::Authenticated;
-    const ConnectionPage claude[] = {ConnectionPage::Claude, ConnectionPage::Import};
+    state.status(2).auth = AuthState::Authenticated;
+    const ConnectionPage claude[] = {2, IMPORT_PAGE};
     assert_pages(state, claude, 2);
 
-    state.openai.auth = AuthState::Refreshing;
-    const ConnectionPage both[] = {ConnectionPage::Codex, ConnectionPage::Claude, ConnectionPage::Import};
+    state.status(1).auth = AuthState::Refreshing;
+    const ConnectionPage both[] = {1, 2, IMPORT_PAGE};
     assert_pages(state, both, 3);
 
-    state.claude.auth = AuthState::SignedOut;
-    const ConnectionPage codex[] = {ConnectionPage::Codex, ConnectionPage::Import};
+    state.status(2).auth = AuthState::SignedOut;
+    const ConnectionPage codex[] = {1, IMPORT_PAGE};
     assert_pages(state, codex, 2);
 }
 
@@ -403,41 +417,133 @@ static void test_expired_credential_state_and_recovery()
 
 static void test_expired_session_navigation()
 {
-    AppSnapshot before{};
+    AppSnapshot before = sample_accounts();
     before.wifi = WifiState::Connected;
-    before.openai.auth = AuthState::Authenticated;
-    before.claude.auth = AuthState::Authenticated;
+    before.status(1).auth = AuthState::Authenticated;
+    before.status(2).auth = AuthState::Authenticated;
     AppSnapshot after = before;
-    apply_credential_failure(after.openai, ErrorCode::Unauthorized);
-    ConnectionPage pages[3];
+    apply_credential_failure(after.status(1), ErrorCode::Unauthorized);
+    auto pages = connection_pages(after);
     TEST_ASSERT_EQUAL(Screen::Dashboard, select_screen(after));
-    TEST_ASSERT_EQUAL_size_t(3, connection_pages(after, pages, 3));
-    TEST_ASSERT_EQUAL(ConnectionPage::Codex, pages[0]);
-    TEST_ASSERT_EQUAL(ConnectionPage::Claude, pages[1]);
-    TEST_ASSERT_EQUAL(ConnectionPage::Import, pages[2]);
-    TEST_ASSERT_EQUAL(ConnectionPage::Codex, focus_after_usage_change(ConnectionPage::Claude, before, after));
+    TEST_ASSERT_EQUAL_size_t(3, connection_pages(after).size());
+    TEST_ASSERT_EQUAL(1, pages[0]);
+    TEST_ASSERT_EQUAL(2, pages[1]);
+    TEST_ASSERT_EQUAL(IMPORT_PAGE, pages[2]);
+    TEST_ASSERT_EQUAL(1, focus_after_usage_change(2, before, after));
     before = after;
-    after.claude.quota = QuotaState::Fresh;
-    after.claude.fetched_at = 100;
-    TEST_ASSERT_EQUAL(ConnectionPage::Codex, focus_after_usage_change(ConnectionPage::Codex, before, after));
-    TEST_ASSERT_EQUAL(ConnectionPage::Claude, focus_after_usage_change(ConnectionPage::Claude, before, after));
+    after.status(2).quota = QuotaState::Fresh;
+    after.status(2).fetched_at = 100;
+    TEST_ASSERT_EQUAL(1, focus_after_usage_change(1, before, after));
+    TEST_ASSERT_EQUAL(2, focus_after_usage_change(2, before, after));
     before = after;
-    apply_credential_failure(after.claude, ErrorCode::Unauthorized);
-    TEST_ASSERT_EQUAL(ConnectionPage::Claude, focus_after_usage_change(ConnectionPage::Codex, before, after));
-    TEST_ASSERT_EQUAL_size_t(3, connection_pages(after, pages, 3));
-    after.claude.auth = AuthState::Authenticated;
-    after.openai.auth = AuthState::Authenticated;
-    after.openai.quota = QuotaState::Fresh;
-    after.openai.fetched_at = 200;
-    TEST_ASSERT_EQUAL(ConnectionPage::Codex, focus_after_usage_change(ConnectionPage::Claude, before, after));
-    after.openai.auth = AuthState::SignedOut;
-    TEST_ASSERT_EQUAL_size_t(2, connection_pages(after, pages, 3));
-    TEST_ASSERT_EQUAL(ConnectionPage::Claude, pages[0]);
+    apply_credential_failure(after.status(2), ErrorCode::Unauthorized);
+    TEST_ASSERT_EQUAL(2, focus_after_usage_change(1, before, after));
+    TEST_ASSERT_EQUAL_size_t(3, connection_pages(after).size());
+    after.status(2).auth = AuthState::Authenticated;
+    after.status(1).auth = AuthState::Authenticated;
+    after.status(1).quota = QuotaState::Fresh;
+    after.status(1).fetched_at = 200;
+    TEST_ASSERT_EQUAL(1, focus_after_usage_change(2, before, after));
+    after.status(1).auth = AuthState::SignedOut;
+    TEST_ASSERT_EQUAL_size_t(2, connection_pages(after).size());
+    TEST_ASSERT_EQUAL(2, connection_pages(after)[0]);
+}
+
+static void test_account_record_codec_and_upload_targets()
+{
+    Account account{};
+    TEST_ASSERT_TRUE(parse_upload_account("codex", "V29yayBUZWFt", &account));
+    TEST_ASSERT_EQUAL_STRING("Work Team", account.name);
+    TEST_ASSERT_EQUAL(Provider::OpenAI, account.provider);
+    TEST_ASSERT_TRUE(same_account_target(account, Provider::OpenAI, "Work Team"));
+    TEST_ASSERT_FALSE(same_account_target(account, Provider::Claude, "Work Team"));
+    TEST_ASSERT_FALSE(same_account_target(account, Provider::OpenAI, "work team"));
+    TEST_ASSERT_TRUE(parse_upload_account("claude", "V29yayBUZWFt", &account));
+    TEST_ASSERT_EQUAL(Provider::Claude, account.provider);
+    for (const char *invalid : {"", "YQ==", "Yh", "YQ\n", "AA", "Cg", "IFdvcms", "V29yayA", "w6k", "!"}) {
+        TEST_ASSERT_FALSE(parse_upload_account("codex", invalid, &account));
+    }
+    TEST_ASSERT_FALSE(parse_upload_account("all", "V29yaw", &account));
+    TEST_ASSERT_FALSE(parse_upload_account("codex", nullptr, &account));
+    char encoded[64];
+    char name[34];
+    memset(name, 'x', 33);
+    name[33] = 0;
+    TEST_ASSERT_TRUE(base64url_encode(reinterpret_cast<const uint8_t *>(name), 33, encoded, sizeof(encoded)));
+    TEST_ASSERT_FALSE(parse_upload_account("codex", encoded, &account));
+    name[32] = 0;
+    TEST_ASSERT_TRUE(base64url_encode(reinterpret_cast<const uint8_t *>(name), 32, encoded, sizeof(encoded)));
+    TEST_ASSERT_TRUE(parse_upload_account("codex", encoded, &account));
+
+    auto original = std::make_unique<AccountRecord>();
+    original->account = {42, Provider::OpenAI, "Work Team", 7};
+    original->bundle.version = TokenBundle::VERSION;
+    strcpy(original->bundle.oauth.access_token, "synthetic-access");
+    strcpy(original->bundle.oauth.refresh_token, "synthetic-refresh");
+    strcpy(original->bundle.account_id, "synthetic-provider-id");
+    auto decoded = std::make_unique<AccountRecord>();
+    std::vector<uint8_t> persisted(sizeof(AccountRecord));
+    memcpy(persisted.data(), original.get(), persisted.size());
+    TEST_ASSERT_TRUE(decode_account_record(persisted.data(), persisted.size(), decoded.get()));
+    TEST_ASSERT_EQUAL(42, decoded->account.id);
+    TEST_ASSERT_EQUAL(7, decoded->account.generation);
+    TEST_ASSERT_EQUAL_STRING("Work Team", decoded->account.name);
+    TEST_ASSERT_EQUAL_MEMORY(&original->bundle, &decoded->bundle, sizeof(TokenBundle));
+    TEST_ASSERT_FALSE(decode_account_record(persisted.data(), persisted.size() - 1, decoded.get()));
+    original->version = 99;
+    TEST_ASSERT_FALSE(decode_account_record(original.get(), sizeof(*original), decoded.get()));
+    original->version = AccountRecord::VERSION;
+    original->account.provider = Provider::Claude;
+    original->bundle.oauth.access_token[0] = 0;
+    TEST_ASSERT_TRUE(decode_account_record(original.get(), sizeof(*original), decoded.get()));
+    original->bundle.oauth.refresh_token[0] = 0;
+    TEST_ASSERT_FALSE(decode_account_record(original.get(), sizeof(*original), decoded.get()));
+}
+
+static void test_dynamic_account_pages_and_isolation()
+{
+    for (size_t count : {1, 10, 20, 22, 300}) {
+        AppSnapshot before = sample_accounts(count);
+        before.wifi = WifiState::Connected;
+        for (auto &entry : before.accounts) {
+            entry.status.auth = AuthState::Authenticated;
+            entry.status.quota = QuotaState::Fresh;
+            entry.status.fetched_at = 100;
+            entry.status.window_count = 1;
+            entry.status.windows[0] = {"Primary", static_cast<float>(entry.account.id), 2000, true};
+        }
+        const auto pages = connection_pages(before);
+        TEST_ASSERT_EQUAL_size_t(count + 1, pages.size());
+        TEST_ASSERT_EQUAL(IMPORT_PAGE, pages.back());
+        for (size_t index = 0; index < count; ++index) TEST_ASSERT_EQUAL(index + 1, pages[index]);
+        AppSnapshot after = before;
+        const AccountId last = static_cast<AccountId>(count);
+        after.status(last).fetched_at = 300;
+        TEST_ASSERT_EQUAL(last, focus_after_usage_change(1, before, after));
+        TEST_ASSERT_EQUAL(IMPORT_PAGE, focus_after_usage_change(IMPORT_PAGE, before, after));
+        apply_credential_failure(after.status(last), ErrorCode::Unauthorized);
+        TEST_ASSERT_EQUAL(last, focus_after_usage_change(1, before, after));
+        TEST_ASSERT_EQUAL(QuotaState::Stale, after.status(last).quota);
+        TEST_ASSERT_FALSE(can_fetch_quota(after.status(last)));
+        TEST_ASSERT_EQUAL_size_t(count + 1, connection_pages(after).size());
+        TEST_ASSERT_EQUAL(Screen::Dashboard, select_screen(after));
+        char countdown[20];
+        for (size_t index = 0; index < count; ++index) {
+            const auto id = static_cast<AccountId>(index + 1);
+            TEST_ASSERT_EQUAL(2000, after.status(id).windows[0].resets_at);
+            format_countdown(after.status(id).windows[0].resets_at, 1990, countdown, sizeof(countdown));
+            TEST_ASSERT_EQUAL_STRING("00:00:10", countdown);
+            if (id != last) TEST_ASSERT_EQUAL_MEMORY(&before.status(id), &after.status(id), sizeof(ProviderStatus));
+        }
+        TEST_ASSERT_EQUAL(last, focus_after_usage_change(last, before, after));
+    }
 }
 
 int main(int, char **)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_account_record_codec_and_upload_targets);
+    RUN_TEST(test_dynamic_account_pages_and_isolation);
     RUN_TEST(test_oauth_refresh_error_classification);
     RUN_TEST(test_expired_credential_state_and_recovery);
     RUN_TEST(test_expired_session_navigation);

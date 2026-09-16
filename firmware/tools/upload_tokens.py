@@ -1,6 +1,7 @@
 import argparse
 import base64
 import binascii
+import hashlib
 import importlib
 import json
 import math
@@ -9,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +23,7 @@ USB_PID = 0x1001
 @dataclass(frozen=True, repr=False)
 class TokenSource:
     provider: str
+    account: str
     access_token: str
     refresh_token: str
     id_token: str
@@ -83,7 +86,7 @@ def codex_auth_path(environment: Mapping[str, str] = os.environ) -> Path:
     return (Path(home).expanduser() if home else Path.home() / ".codex") / "auth.json"
 
 
-def read_codex_tokens(path: Path) -> TokenSource:
+def read_codex_tokens(path: Path, account: str) -> TokenSource:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as error:
@@ -95,6 +98,7 @@ def read_codex_tokens(path: Path) -> TokenSource:
     access = _required_text(tokens, "access_token", "Codex access token")
     return TokenSource(
         provider="codex",
+        account=account,
         access_token=access,
         refresh_token=_required_text(tokens, "refresh_token", "Codex refresh token"),
         id_token=_required_text(tokens, "id_token", "Codex ID token"),
@@ -107,6 +111,11 @@ def claude_credentials_text(
     environment: Mapping[str, str] = os.environ,
     platform: str = sys.platform,
 ) -> str:
+    config_value = environment.get("CLAUDE_CONFIG_DIR", "")
+    service = "Claude Code-credentials"
+    if config_value:
+        normalized = unicodedata.normalize("NFC", config_value).encode("utf-8")
+        service += "-" + hashlib.sha256(normalized).hexdigest()[:8]
     if platform == "darwin":
         security = shutil.which("security")
         if security:
@@ -116,7 +125,7 @@ def claude_credentials_text(
                         security,
                         "find-generic-password",
                         "-s",
-                        "Claude Code-credentials",
+                        service,
                         "-w",
                     ],
                     text=True,
@@ -128,7 +137,7 @@ def claude_credentials_text(
             if result is not None and result.returncode == 0 and result.stdout:
                 return result.stdout
 
-    config_dir = Path(environment.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+    config_dir = Path(config_value or "~/.claude").expanduser()
     path = config_dir / ".credentials.json"
     try:
         return path.read_text(encoding="utf-8")
@@ -136,7 +145,7 @@ def claude_credentials_text(
         raise ValueError(f"Claude credentials could not be read at {path}") from error
 
 
-def read_claude_tokens(text: str) -> TokenSource:
+def read_claude_tokens(text: str, account: str) -> TokenSource:
     document = _parse_json(text, "Claude credential storage")
     oauth = document.get("claudeAiOauth") if isinstance(document, dict) else None
     if not isinstance(oauth, dict):
@@ -151,6 +160,7 @@ def read_claude_tokens(text: str) -> TokenSource:
         raise ValueError("Claude access token expiry is missing or invalid")
     return TokenSource(
         provider="claude",
+        account=account,
         access_token=_optional_text(oauth, "accessToken", "Claude access token"),
         refresh_token=_required_text(oauth, "refreshToken", "Claude refresh token"),
         id_token="",
@@ -160,6 +170,7 @@ def read_claude_tokens(text: str) -> TokenSource:
 
 
 def validate_token_source(source: TokenSource) -> None:
+    validate_target(source.provider, source.account)
     fields = {
         "access token": (source.access_token, 4096),
         "refresh token": (source.refresh_token, 4096),
@@ -179,27 +190,46 @@ def validate_token_source(source: TokenSource) -> None:
         raise ValueError(f"{source.provider.capitalize()} access token expiry is invalid")
 
 
+def validate_target(provider: str, account: str) -> None:
+    if provider not in ("codex", "claude"):
+        raise ValueError("Provider must be codex or claude")
+    if (
+        not isinstance(account, str)
+        or not 1 <= len(account) <= 32
+        or account != account.strip(" ")
+        or any(not 32 <= ord(char) <= 126 for char in account)
+    ):
+        raise ValueError("Account name must be 1-32 printable ASCII characters without edge spaces")
+
+
 def discover_tokens(
-    provider: str = "all",
+    provider: str,
+    account: str,
     codex_path: Path | None = None,
     claude_path: Path | None = None,
 ) -> list[TokenSource]:
-    if provider not in ("codex", "claude", "all"):
-        raise ValueError("Provider must be codex, claude, or all")
-    sources: list[TokenSource] = []
-    if provider in ("codex", "all"):
-        sources.append(read_codex_tokens(codex_path or codex_auth_path()))
-    if provider in ("claude", "all"):
+    validate_target(provider, account)
+    if provider == "codex":
+        if claude_path is not None:
+            raise ValueError("--claude-auth requires --provider claude")
+        source = read_codex_tokens(codex_path or codex_auth_path(), account)
+    else:
+        if codex_path is not None:
+            raise ValueError("--codex-auth requires --provider codex")
         claude_text = (
             claude_path.read_text(encoding="utf-8")
             if claude_path is not None
             else claude_credentials_text()
         )
-        sources.append(read_claude_tokens(claude_text))
+        source = read_claude_tokens(claude_text, account)
+    validate_token_source(source)
+    return [source]
 
-    for source in sources:
-        validate_token_source(source)
-    return sources
+
+def token_begin_command(source: TokenSource) -> bytearray:
+    validate_target(source.provider, source.account)
+    name = base64.urlsafe_b64encode(source.account.encode("ascii")).rstrip(b"=")
+    return bytearray(b"token-begin " + source.provider.encode("ascii") + b" " + name + b"\r\n")
 
 
 def field_commands(field: str, value: str, chunk_size: int = 120) -> list[bytearray]:
@@ -247,6 +277,8 @@ def _send_command(connection: Any, command: bytearray, expected: bytes) -> None:
 
 
 def send_tokens(port: str, sources: list[TokenSource]) -> None:
+    for source in sources:
+        validate_token_source(source)
     serial = importlib.import_module("serial")
     with serial.Serial(
         port=port, baudrate=115200, timeout=0.2, write_timeout=2
@@ -257,7 +289,7 @@ def send_tokens(port: str, sources: list[TokenSource]) -> None:
         for source in sources:
             _send_command(
                 connection,
-                bytearray(f"token-begin {source.provider}\r\n".encode()),
+                token_begin_command(source),
                 b"OK: token upload started.",
             )
             fields = (
@@ -283,8 +315,9 @@ def main() -> int:
     )
     parser.add_argument("--port")
     parser.add_argument(
-        "--provider", choices=("codex", "claude", "all"), default="all"
+        "--provider", choices=("codex", "claude"), required=True
     )
+    parser.add_argument("--account", required=True)
     parser.add_argument("--codex-auth", type=Path)
     parser.add_argument("--claude-auth", type=Path)
     args = parser.parse_args()
@@ -294,13 +327,14 @@ def main() -> int:
             provider=args.provider,
             codex_path=args.codex_auth,
             claude_path=args.claude_auth,
+            account=args.account,
         )
         list_ports = importlib.import_module("serial.tools.list_ports")
         send_tokens(args.port or find_device_port(list_ports), sources)
     except (ImportError, OSError, RuntimeError, TimeoutError, ValueError) as error:
         sys.stderr.write(f"Token upload failed: {error}\n")
         return 1
-    providers = " and ".join(source.provider.capitalize() for source in sources)
+    providers = " and ".join(f"{source.provider} - {source.account}" for source in sources)
     sys.stdout.write(f"{providers} credentials uploaded; Quota Meter is restarting.\n")
     return 0
 
