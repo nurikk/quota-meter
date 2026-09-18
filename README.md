@@ -6,7 +6,11 @@ standalone ESP32-S3 display.
 ## ESP32 display
 
 The device shows quota usage and reset timers for multiple Codex and Claude
-accounts. Recently active accounts rotate every 10 seconds; inactive accounts
+accounts, including **multiple accounts of the same provider** — for example,
+three Codex accounts and two Claude accounts on one device. Each account has its
+own name, quota data, and screen; you are not limited to one account per provider.
+
+Recently active accounts rotate every 10 seconds; inactive accounts
 get an occasional slot every two minutes. See the [firmware guide](firmware/README.md)
 for hardware, setup, and build instructions.
 
