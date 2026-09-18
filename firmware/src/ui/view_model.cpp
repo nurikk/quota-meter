@@ -1,4 +1,5 @@
 #include "view_model.h"
+#include <algorithm>
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -86,33 +87,102 @@ void format_window_period(const QuotaWindow *window, const char *fallback, char 
     else snprintf(output, length, "%s", fallback ? fallback : "--");
 }
 
-static bool quota_updated(const ProviderStatus &before, const ProviderStatus &after)
+static bool usage_grew(const ProviderStatus &before, const ProviderStatus &after)
 {
-    return after.quota == QuotaState::Fresh && after.fetched_at > 0 &&
-           after.fetched_at != before.fetched_at;
-}
-
-ConnectionPage focus_after_usage_change(ConnectionPage current, const AppSnapshot &previous,
-                                        const AppSnapshot &current_snapshot)
-{
-    for (const auto &entry : current_snapshot.accounts) {
-        const auto *before = previous.find(entry.account.id);
-        if (entry.status.auth == AuthState::Expired && (!before || before->status.auth != AuthState::Expired))
-            return entry.account.id;
-    }
-    const auto *active = current_snapshot.find(current);
-    if (active && active->status.auth == AuthState::Expired) return current;
-    if (current == IMPORT_PAGE) return current;
-    ConnectionPage next = current;
-    int64_t latest = 0;
-    for (const auto &entry : current_snapshot.accounts) {
-        const auto *before = previous.find(entry.account.id);
-        if (quota_updated(before ? before->status : ProviderStatus{}, entry.status) && entry.status.fetched_at > latest) {
-            next = entry.account.id;
-            latest = entry.status.fetched_at;
+    if (!is_connected(after) || after.quota != QuotaState::Fresh || after.error != ErrorCode::None ||
+        (before.quota != QuotaState::Fresh && before.quota != QuotaState::Stale)) return false;
+    for (uint8_t index = 0; index < after.window_count; ++index) {
+        const auto &window = after.windows[index];
+        if (!window.present) continue;
+        for (uint8_t old_index = 0; old_index < before.window_count; ++old_index) {
+            const auto &old = before.windows[old_index];
+            if (old.present && same_label(old.label, window.label) &&
+                old.model_limit == window.model_limit && old.window_minutes == window.window_minutes &&
+                old.resets_at == window.resets_at && window.used_percent > old.used_percent) return true;
         }
     }
-    return next;
+    return false;
+}
+
+static ConnectionPage next_page(const std::vector<ConnectionPage> &pages, ConnectionPage current)
+{
+    const auto found = std::find(pages.begin(), pages.end(), current);
+    return found == pages.end() || found + 1 == pages.end() ? pages.front() : *(found + 1);
+}
+
+void AccountCarousel::reset_dwell(uint32_t now_ms)
+{
+    dwell_started_ms_ = now_ms;
+}
+
+ConnectionPage AccountCarousel::update(ConnectionPage current, const AppSnapshot &previous,
+                                        const AppSnapshot &snapshot, uint32_t now_ms)
+{
+    constexpr uint32_t DWELL_MS = 10000;
+    constexpr uint32_t IDLE_INTERVAL_MS = 120000;
+    constexpr uint32_t ACTIVITY_MS = 600000;
+    if (!initialized_) {
+        initialized_ = true;
+        reset_dwell(now_ms);
+        idle_slot_ms_ = now_ms;
+    }
+    activity_.erase(std::remove_if(activity_.begin(), activity_.end(), [&](const Activity &activity) {
+        const auto *entry = snapshot.find(activity.id);
+        return !entry || entry->account.generation != activity.generation || !is_connected(entry->status);
+    }), activity_.end());
+    std::vector<ConnectionPage> eligible;
+    std::vector<ConnectionPage> active;
+    std::vector<ConnectionPage> idle;
+    ConnectionPage expired = IMPORT_PAGE;
+    for (const auto &entry : snapshot.accounts) {
+        const auto *before = previous.find(entry.account.id);
+        if (expired == IMPORT_PAGE && entry.status.auth == AuthState::Expired &&
+            (!before || before->status.auth != AuthState::Expired ||
+             before->account.generation != entry.account.generation)) expired = entry.account.id;
+        if (!is_connected(entry.status)) continue;
+        auto activity = std::find_if(activity_.begin(), activity_.end(), [&](const Activity &value) {
+            return value.id == entry.account.id;
+        });
+        if (activity == activity_.end()) {
+            activity_.push_back({entry.account.id, entry.account.generation});
+            activity = activity_.end() - 1;
+        } else if (before && before->account.generation == entry.account.generation &&
+                   usage_grew(before->status, entry.status)) {
+            activity->last_growth_ms = now_ms;
+            activity->active = true;
+        }
+        if (activity->active && static_cast<uint32_t>(now_ms - activity->last_growth_ms) >= ACTIVITY_MS)
+            activity->active = false;
+        eligible.push_back(entry.account.id);
+        (activity->active ? active : idle).push_back(entry.account.id);
+    }
+    if (active.empty()) {
+        idle_slot_ms_ = now_ms;
+        idle_due_ = false;
+    } else if (static_cast<uint32_t>(now_ms - idle_slot_ms_) >= IDLE_INTERVAL_MS) {
+        idle_due_ = true;
+    }
+    if (expired != IMPORT_PAGE) {
+        reset_dwell(now_ms);
+        return expired;
+    }
+    const auto *shown = snapshot.find(current);
+    if (current == IMPORT_PAGE || (shown && shown->status.auth == AuthState::Expired)) return current;
+    if (!shown || !is_connected(shown->status)) {
+        reset_dwell(now_ms);
+        return eligible.empty() ? connection_pages(snapshot).front() : eligible.front();
+    }
+    if (std::find(active.begin(), active.end(), current) != active.end()) last_active_ = current;
+    if (static_cast<uint32_t>(now_ms - dwell_started_ms_) < DWELL_MS) return current;
+    reset_dwell(now_ms);
+    if (active.empty()) return next_page(eligible, current);
+    if (idle_due_ && !idle.empty()) {
+        last_idle_ = next_page(idle, last_idle_);
+        idle_slot_ms_ = now_ms;
+        idle_due_ = false;
+        return last_idle_;
+    }
+    return next_page(active, last_active_);
 }
 
 float elapsed_percent(const QuotaWindow &window, int64_t now, int window_minutes)

@@ -15,8 +15,27 @@ const QuotaWindow *find_quota_window(const ProviderStatus &status, const char *s
 const QuotaWindow *find_model_limit(const ProviderStatus &status, const char *preferred_label);
 const QuotaWindow *find_quota_window_by_duration(const ProviderStatus &status, int32_t window_minutes);
 void format_window_period(const QuotaWindow *window, const char *fallback, char *output, size_t output_len);
-ConnectionPage focus_after_usage_change(ConnectionPage current, const AppSnapshot &previous,
-                                        const AppSnapshot &current_snapshot);
+class AccountCarousel {
+public:
+    ConnectionPage update(ConnectionPage current, const AppSnapshot &previous,
+                          const AppSnapshot &snapshot, uint32_t now_ms);
+    void reset_dwell(uint32_t now_ms);
+
+private:
+    struct Activity {
+        AccountId id;
+        uint32_t generation;
+        uint32_t last_growth_ms{};
+        bool active{};
+    };
+    std::vector<Activity> activity_;
+    bool initialized_{};
+    uint32_t dwell_started_ms_{};
+    uint32_t idle_slot_ms_{};
+    bool idle_due_{};
+    ConnectionPage last_active_{IMPORT_PAGE};
+    ConnectionPage last_idle_{IMPORT_PAGE};
+};
 float elapsed_percent(const QuotaWindow &window, int64_t now, int window_minutes);
 UsageRisk usage_risk(float used_percent, float elapsed_percent);
 void format_countdown(int64_t resets_at, int64_t now, char *output, size_t output_len);

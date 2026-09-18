@@ -7,6 +7,7 @@
 #include "domain/state_reducer.h"
 #include "auth/token_store.h"
 #include <memory>
+#include <utility>
 #include "console/token_upload.h"
 #include "net/http_client.h"
 #include "portal/portal_logic.h"
@@ -224,53 +225,211 @@ static void assert_pages(const AppSnapshot &state, const ConnectionPage *expecte
     }
 }
 
-static void test_usage_change_focus_policy()
+static AppSnapshot carousel_accounts(size_t count = 3)
 {
-    AppSnapshot before = sample_accounts();
-    before.status(1).quota = QuotaState::Fresh;
-    before.status(1).window_count = 1;
-    before.status(1).windows[0] = {"Primary", 10, 1000, true};
-    before.status(1).fetched_at = 1000;
-    before.status(2).quota = QuotaState::Fresh;
-    before.status(2).window_count = 1;
-    before.status(2).windows[0] = {"5 hour", 20, 2000, true};
-    before.status(2).fetched_at = 2000;
+    AppSnapshot snapshot = sample_accounts(count);
+    for (auto &entry : snapshot.accounts) {
+        entry.status.auth = AuthState::Authenticated;
+        entry.status.quota = QuotaState::Fresh;
+        entry.status.fetched_at = 1000;
+        entry.status.window_count = 2;
+        entry.status.windows[0] = {"Primary", 10, 2000, true, false, 300};
+        entry.status.windows[1] = {"Secondary", 20, 9000, true, false, 10080};
+    }
+    return snapshot;
+}
 
+static void test_carousel_active_rotation_and_idle_slots()
+{
+    for (size_t count : {3, 4}) {
+        AccountCarousel carousel;
+        AppSnapshot before = carousel_accounts(count);
+        ConnectionPage page = carousel.update(1, AppSnapshot{}, before, 0);
+        AppSnapshot after = before;
+        after.status(1).windows[0].used_percent += 1;
+        after.status(2).windows[1].used_percent += 1;
+        TEST_ASSERT_EQUAL(1, carousel.update(page, before, after, 0));
+        TEST_ASSERT_EQUAL(1, carousel.update(page, after, after, 9999));
+        for (uint32_t tick = 1; tick <= 49; ++tick) {
+            page = carousel.update(page, after, after, tick * 10000);
+            if (tick % 12 == 0) {
+                const AccountId idle = count == 3 || (tick / 12) % 2 == 1 ? 3 : 4;
+                TEST_ASSERT_EQUAL(idle, page);
+                TEST_ASSERT_EQUAL(page, carousel.update(page, after, after, tick * 10000 + 9999));
+            } else {
+                TEST_ASSERT_TRUE(page == 1 || page == 2);
+                if (tick == 1) TEST_ASSERT_EQUAL(2, page);
+                if (tick == 2) TEST_ASSERT_EQUAL(1, page);
+                if (tick == 13) TEST_ASSERT_EQUAL(1, page);
+            }
+        }
+    }
+}
+
+static void test_carousel_usage_growth_detection()
+{
+    for (int change = 0; change < 13; ++change) {
+        AccountCarousel carousel;
+        AppSnapshot before = carousel_accounts();
+        TEST_ASSERT_EQUAL(1, carousel.update(1, AppSnapshot{}, before, 0));
+        AppSnapshot after = before;
+        auto &status = after.status(2);
+        switch (change) {
+        case 0: status.fetched_at += 100; break;
+        case 1: status.fetched_at -= 100; break;
+        case 2: std::swap(status.windows[0], status.windows[1]); break;
+        case 3: status.windows[0].used_percent -= 1; break;
+        case 4: status.windows[0].resets_at += 1000; status.windows[0].used_percent += 1; break;
+        case 5: status.quota = QuotaState::Stale; status.windows[0].used_percent += 1; break;
+        case 6: status.quota = QuotaState::Error; status.windows[0].used_percent += 1; break;
+        case 7: status.error = ErrorCode::Network; status.windows[0].used_percent += 1; break;
+        case 8: status.windows[0].present = false; status.windows[0].used_percent += 1; break;
+        case 9: status.windows[0].window_minutes = 60; status.windows[0].used_percent += 1; break;
+        case 10: status.windows[0].model_limit = true; status.windows[0].used_percent += 1; break;
+        case 11: strcpy(status.windows[0].label, "New window"); status.windows[0].used_percent += 1; break;
+        case 12:
+            std::swap(status.windows[0], status.windows[1]);
+            status.windows[1].used_percent += 0.25f;
+            break;
+        }
+        TEST_ASSERT_EQUAL(1, carousel.update(1, before, after, 1000));
+        TEST_ASSERT_EQUAL(2, carousel.update(1, after, after, 10000));
+        TEST_ASSERT_EQUAL(change == 12 ? 2 : 3, carousel.update(2, after, after, 20000));
+    }
+}
+
+static void test_carousel_baselines_and_activity_expiry()
+{
+    for (QuotaState quota : {QuotaState::Fresh, QuotaState::Stale}) {
+        AccountCarousel carousel;
+        AppSnapshot before = carousel_accounts();
+        before.status(2).quota = quota;
+        TEST_ASSERT_EQUAL(1, carousel.update(1, AppSnapshot{}, before, 0));
+        TEST_ASSERT_EQUAL(2, carousel.update(1, before, before, 10000));
+        TEST_ASSERT_EQUAL(3, carousel.update(2, before, before, 20000));
+        AppSnapshot after = before;
+        after.status(2).quota = QuotaState::Fresh;
+        after.status(2).windows[0].used_percent += 1;
+        TEST_ASSERT_EQUAL(3, carousel.update(3, before, after, 21000));
+        TEST_ASSERT_EQUAL(2, carousel.update(3, after, after, 30000));
+        ConnectionPage page = 2;
+        for (uint32_t now = 40000; now <= 610000; now += 10000) {
+            before = after;
+            after.status(2).fetched_at += 10;
+            page = carousel.update(page, before, after, now);
+        }
+        carousel.reset_dwell(611000);
+        TEST_ASSERT_EQUAL(2, carousel.update(2, after, after, 620999));
+        TEST_ASSERT_EQUAL(3, carousel.update(2, after, after, 621000));
+    }
+    AccountCarousel carousel;
+    AppSnapshot before = carousel_accounts();
+    before.status(2).window_count = 0;
+    before.status(2).quota = QuotaState::Loading;
+    carousel.update(1, AppSnapshot{}, before, 0);
+    AppSnapshot after = carousel_accounts();
+    TEST_ASSERT_EQUAL(1, carousel.update(1, before, after, 1000));
+    TEST_ASSERT_EQUAL(2, carousel.update(1, after, after, 10000));
+    TEST_ASSERT_EQUAL(3, carousel.update(2, after, after, 20000));
+}
+
+static void test_carousel_idle_single_manual_and_wrap()
+{
+    for (uint32_t start : {0u, UINT32_MAX - 5000}) {
+        AccountCarousel carousel;
+        AppSnapshot snapshot = carousel_accounts();
+        ConnectionPage page = carousel.update(1, AppSnapshot{}, snapshot, start);
+        for (uint32_t tick = 1; tick <= 70; ++tick) {
+            page = carousel.update(page, snapshot, snapshot, start + tick * 10000);
+            TEST_ASSERT_EQUAL(tick % 3 + 1, page);
+        }
+        carousel.reset_dwell(start + 705000);
+        TEST_ASSERT_EQUAL(3, carousel.update(3, snapshot, snapshot, start + 710000));
+        TEST_ASSERT_EQUAL(3, carousel.update(3, snapshot, snapshot, start + 714999));
+        TEST_ASSERT_EQUAL(1, carousel.update(3, snapshot, snapshot, start + 715000));
+        carousel.reset_dwell(start + 716000);
+        TEST_ASSERT_EQUAL(IMPORT_PAGE, carousel.update(IMPORT_PAGE, snapshot, snapshot, start + 900000));
+    }
+    AccountCarousel carousel;
+    AppSnapshot snapshot = carousel_accounts(1);
+    TEST_ASSERT_EQUAL(1, carousel.update(1, AppSnapshot{}, snapshot, 0));
+    for (uint32_t now : {10000, 120000, 600000})
+        TEST_ASSERT_EQUAL(1, carousel.update(1, snapshot, snapshot, now));
+    AppSnapshot empty;
+    TEST_ASSERT_EQUAL(IMPORT_PAGE, carousel.update(1, snapshot, empty, 610000));
+}
+
+static void test_carousel_active_manual_and_wrap()
+{
+    for (uint32_t start : {0u, UINT32_MAX - 5000}) {
+        AccountCarousel carousel;
+        AppSnapshot before = carousel_accounts();
+        carousel.update(1, AppSnapshot{}, before, start);
+        AppSnapshot after = before;
+        after.status(1).windows[0].used_percent += 1;
+        after.status(2).windows[0].used_percent += 1;
+        carousel.update(1, before, after, start + 1000);
+        carousel.reset_dwell(start + 5000);
+        TEST_ASSERT_EQUAL(2, carousel.update(2, after, after, start + 14999));
+        TEST_ASSERT_EQUAL(1, carousel.update(2, after, after, start + 15000));
+        carousel.reset_dwell(start + 16000);
+        before = after;
+        after.status(1).windows[0].used_percent += 1;
+        TEST_ASSERT_EQUAL(IMPORT_PAGE, carousel.update(IMPORT_PAGE, before, after, start + 20000));
+        TEST_ASSERT_EQUAL(IMPORT_PAGE, carousel.update(IMPORT_PAGE, after, after, start + 120000));
+        carousel.reset_dwell(start + 121000);
+        TEST_ASSERT_EQUAL(2, carousel.update(2, after, after, start + 130999));
+        TEST_ASSERT_EQUAL(3, carousel.update(2, after, after, start + 131000));
+        TEST_ASSERT_EQUAL(1, carousel.update(3, after, after, start + 141000));
+        TEST_ASSERT_EQUAL(3, carousel.update(2, after, after, start + 620000));
+    }
+}
+
+static void test_carousel_scroll_deadline_and_expiration()
+{
+    AccountCarousel carousel;
+    AppSnapshot snapshot = carousel_accounts();
+    carousel.update(3, AppSnapshot{}, snapshot, 0);
+    for (uint32_t now : {9750, 10000, 10250}) {
+        carousel.reset_dwell(now);
+        TEST_ASSERT_EQUAL(3, carousel.update(3, snapshot, snapshot, now));
+    }
+    carousel.reset_dwell(10500);
+    TEST_ASSERT_EQUAL(IMPORT_PAGE, carousel.update(IMPORT_PAGE, snapshot, snapshot, 30000));
+    carousel.reset_dwell(31000);
+    TEST_ASSERT_EQUAL(2, carousel.update(2, snapshot, snapshot, 40999));
+    TEST_ASSERT_EQUAL(3, carousel.update(2, snapshot, snapshot, 41000));
+    AppSnapshot expired = snapshot;
+    apply_credential_failure(expired.status(1), ErrorCode::Unauthorized);
+    carousel.reset_dwell(51000);
+    TEST_ASSERT_EQUAL(1, carousel.update(3, snapshot, expired, 51000));
+}
+
+
+static void test_carousel_account_changes()
+{
+    AccountCarousel carousel;
+    AppSnapshot before = carousel_accounts();
+    carousel.update(1, AppSnapshot{}, before, 0);
     AppSnapshot after = before;
-    after.status(2).fetched_at = 3000;
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(2),
-                          static_cast<int>(focus_after_usage_change(1, before, after)));
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(IMPORT_PAGE),
-                          static_cast<int>(focus_after_usage_change(IMPORT_PAGE, before, after)));
-
-    after = before;
-    after.status(2).windows[0].resets_at = 3000;
-    after.status(2).windows[0].used_percent = 21;
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(1),
-                          static_cast<int>(focus_after_usage_change(1, before, after)));
-
-    AppSnapshot initial = sample_accounts();
-    initial.status(1).quota = QuotaState::Fresh;
-    initial.status(1).window_count = 1;
-    initial.status(1).windows[0] = {"Primary", 10, 1000, true};
-    initial.status(1).fetched_at = 1000;
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(1),
-                          static_cast<int>(focus_after_usage_change(2, AppSnapshot{}, initial)));
-    initial.status(1).quota = QuotaState::Stale;
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(2),
-                          static_cast<int>(focus_after_usage_change(2, AppSnapshot{}, initial)));
-
-    after = before;
-    after.status(1).fetched_at = 4000;
-    after.status(2).fetched_at = 3000;
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(1),
-                          static_cast<int>(focus_after_usage_change(2, before, after)));
-
-    before.status(2).fetched_at = 5000;
-    after = before;
-    after.status(2).fetched_at = 3000;
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(2),
-                          static_cast<int>(focus_after_usage_change(1, before, after)));
+    after.status(2).windows[0].used_percent += 1;
+    carousel.update(1, before, after, 1000);
+    TEST_ASSERT_EQUAL(2, carousel.update(1, after, after, 10000));
+    before = after;
+    ++after.accounts[1].account.generation;
+    after.status(2).windows[0].used_percent += 1;
+    TEST_ASSERT_EQUAL(3, carousel.update(2, before, after, 20000));
+    before = after;
+    after.accounts.erase(after.accounts.begin() + 2);
+    TEST_ASSERT_EQUAL(1, carousel.update(3, before, after, 21000));
+    TEST_ASSERT_EQUAL(1, carousel.update(1, after, after, 30999));
+    TEST_ASSERT_EQUAL(2, carousel.update(1, after, after, 31000));
+    before = after;
+    after.accounts.push_back(carousel_accounts().accounts.back());
+    after.status(3).windows[0].used_percent = 99;
+    TEST_ASSERT_EQUAL(2, carousel.update(2, before, after, 32000));
+    TEST_ASSERT_EQUAL(3, carousel.update(2, after, after, 41000));
+    TEST_ASSERT_EQUAL(1, carousel.update(3, after, after, 51000));
 }
 
 static void test_connection_page_order()
@@ -429,21 +588,28 @@ static void test_expired_session_navigation()
     TEST_ASSERT_EQUAL(1, pages[0]);
     TEST_ASSERT_EQUAL(2, pages[1]);
     TEST_ASSERT_EQUAL(IMPORT_PAGE, pages[2]);
-    TEST_ASSERT_EQUAL(1, focus_after_usage_change(2, before, after));
+    AccountCarousel carousel;
+    carousel.update(2, AppSnapshot{}, before, 0);
+    TEST_ASSERT_EQUAL(1, carousel.update(2, before, after, 1000));
     before = after;
     after.status(2).quota = QuotaState::Fresh;
     after.status(2).fetched_at = 100;
-    TEST_ASSERT_EQUAL(1, focus_after_usage_change(1, before, after));
-    TEST_ASSERT_EQUAL(2, focus_after_usage_change(2, before, after));
+    TEST_ASSERT_EQUAL(1, carousel.update(1, before, after, 120000));
+    carousel.reset_dwell(121000);
+    TEST_ASSERT_EQUAL(2, carousel.update(2, after, after, 130999));
+    TEST_ASSERT_EQUAL(2, carousel.update(2, after, after, 131000));
     before = after;
     apply_credential_failure(after.status(2), ErrorCode::Unauthorized);
-    TEST_ASSERT_EQUAL(2, focus_after_usage_change(1, before, after));
+    TEST_ASSERT_EQUAL(2, carousel.update(1, before, after, 132000));
+    TEST_ASSERT_EQUAL(2, carousel.update(IMPORT_PAGE, before, after, 132000));
+    TEST_ASSERT_EQUAL(2, carousel.update(2, after, after, 800000));
     TEST_ASSERT_EQUAL_size_t(3, connection_pages(after).size());
+    before = after;
     after.status(2).auth = AuthState::Authenticated;
     after.status(1).auth = AuthState::Authenticated;
     after.status(1).quota = QuotaState::Fresh;
     after.status(1).fetched_at = 200;
-    TEST_ASSERT_EQUAL(1, focus_after_usage_change(2, before, after));
+    TEST_ASSERT_EQUAL(1, carousel.update(2, before, after, 810000));
     after.status(1).auth = AuthState::SignedOut;
     TEST_ASSERT_EQUAL_size_t(2, connection_pages(after).size());
     TEST_ASSERT_EQUAL(2, connection_pages(after)[0]);
@@ -519,10 +685,12 @@ static void test_dynamic_account_pages_and_isolation()
         AppSnapshot after = before;
         const AccountId last = static_cast<AccountId>(count);
         after.status(last).fetched_at = 300;
-        TEST_ASSERT_EQUAL(last, focus_after_usage_change(1, before, after));
-        TEST_ASSERT_EQUAL(IMPORT_PAGE, focus_after_usage_change(IMPORT_PAGE, before, after));
+        AccountCarousel carousel;
+        carousel.update(1, AppSnapshot{}, before, 0);
+        TEST_ASSERT_EQUAL(1, carousel.update(1, before, after, 1000));
+        TEST_ASSERT_EQUAL(IMPORT_PAGE, carousel.update(IMPORT_PAGE, after, after, 2000));
         apply_credential_failure(after.status(last), ErrorCode::Unauthorized);
-        TEST_ASSERT_EQUAL(last, focus_after_usage_change(1, before, after));
+        TEST_ASSERT_EQUAL(last, carousel.update(1, before, after, 3000));
         TEST_ASSERT_EQUAL(QuotaState::Stale, after.status(last).quota);
         TEST_ASSERT_FALSE(can_fetch_quota(after.status(last)));
         TEST_ASSERT_EQUAL_size_t(count + 1, connection_pages(after).size());
@@ -535,7 +703,7 @@ static void test_dynamic_account_pages_and_isolation()
             TEST_ASSERT_EQUAL_STRING("00:00:10", countdown);
             if (id != last) TEST_ASSERT_EQUAL_MEMORY(&before.status(id), &after.status(id), sizeof(ProviderStatus));
         }
-        TEST_ASSERT_EQUAL(last, focus_after_usage_change(last, before, after));
+        TEST_ASSERT_EQUAL(last, carousel.update(last, after, after, 120000));
     }
 }
 
@@ -559,7 +727,14 @@ int main(int, char **)
     RUN_TEST(test_dashboard_view_model);
     RUN_TEST(test_reducer_and_portal_helpers);
     RUN_TEST(test_connection_page_order);
-    RUN_TEST(test_usage_change_focus_policy);
+    RUN_TEST(test_carousel_active_rotation_and_idle_slots);
+    RUN_TEST(test_carousel_usage_growth_detection);
+    RUN_TEST(test_carousel_baselines_and_activity_expiry);
+    RUN_TEST(test_carousel_idle_single_manual_and_wrap);
+    RUN_TEST(test_carousel_account_changes);
+    RUN_TEST(test_carousel_active_manual_and_wrap);
+    RUN_TEST(test_carousel_scroll_deadline_and_expiration);
+
     return UNITY_END();
 }
 #endif

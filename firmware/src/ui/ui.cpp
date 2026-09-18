@@ -151,6 +151,7 @@ struct TileEntry {
 lv_obj_t *root;
 std::vector<TileEntry> tiles;
 ConnectionPage active_page = IMPORT_PAGE;
+AccountCarousel carousel;
 
 struct QuotaBinding {
     QuotaWindow window;
@@ -552,7 +553,10 @@ void tile_changed(lv_event_t *event)
     lv_obj_t *active = lv_tileview_get_tile_active(tileview);
     for (size_t index = 0; index < tiles.size(); ++index) {
         if (tiles[index].tile == active) {
-            active_page = tiles[index].page;
+            if (active_page != tiles[index].page) {
+                active_page = tiles[index].page;
+                carousel.reset_dwell(lv_tick_get());
+            }
             return;
         }
     }
@@ -664,13 +668,25 @@ void ui_task(void *)
         AppSnapshot current = app_state_get();
         const int64_t current_second = static_cast<int64_t>(time(nullptr));
         const bool state_changed = current.revision != previous.revision;
-        if (!state_changed && current_second == rendered_second) continue;
         if (bsp_display_lock(UI_UPDATE_LOCK_TIMEOUT_MS)) {
-            if (state_changed) {
-                active_page = focus_after_usage_change(active_page, previous, current);
-                render(current);
+            const uint32_t now_ms = lv_tick_get();
+            if (!tiles.empty() && lv_obj_is_scrolling(lv_obj_get_parent(tiles.front().tile)))
+                carousel.reset_dwell(now_ms);
+            const ConnectionPage next = carousel.update(active_page, previous, current, now_ms);
+            const bool page_changed = next != active_page;
+            active_page = next;
+            if (state_changed) render(current);
+            else {
+                if (page_changed) {
+                    for (const auto &entry : tiles) {
+                        if (entry.page == active_page) {
+                            lv_tileview_set_tile(lv_obj_get_parent(entry.tile), entry.tile, LV_ANIM_OFF);
+                            break;
+                        }
+                    }
+                }
+                if (current_second != rendered_second) update_quota_bindings(current_second);
             }
-            else update_quota_bindings(current_second);
             bsp_display_unlock();
             previous = current;
             rendered_second = current_second;
