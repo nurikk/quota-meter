@@ -1,7 +1,33 @@
 # quota-meter
 
-A small Python spike that shows subscription quota data through the locally installed
-official OpenAI Codex and Claude Code CLIs.
+Subscription quota monitoring for OpenAI Codex and Claude, with a Python CLI and a
+standalone ESP32-S3 display.
+
+## ESP32 display
+
+The device shows quota usage and reset timers for multiple Codex and Claude
+accounts. Recently active accounts rotate every 10 seconds; inactive accounts
+get an occasional slot every two minutes. See the [firmware guide](firmware/README.md)
+for hardware, setup, and build instructions.
+
+Hardware: [JC3248W535EN ESP32-S3 display on AliExpress](https://www.aliexpress.com/item/1005008870532063.html).
+
+### Screenshots
+
+Captured directly from the device's framebuffer at 480×320, not photographed.
+
+| Codex | Claude |
+| --- | --- |
+| ![Codex quota screen](images/codex-screen.png) | ![Claude quota screen](images/claude-screen.png) |
+
+### Device photos
+
+No stand needed: the device sits securely on the desk, supported by its USB cable,
+as shown below.
+
+| Front | Back |
+| --- | --- |
+| ![Quota Meter display on a desk](images/IMG_4320%20Medium.jpeg) | ![Back of the Quota Meter with USB connection](images/IMG_4319%20Medium.jpeg) |
 
 ## Prerequisites
 
