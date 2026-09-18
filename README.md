@@ -29,8 +29,61 @@ as shown below.
 | --- | --- |
 | ![Quota Meter display on a desk](images/IMG_4320%20Medium.jpeg) | ![Back of the Quota Meter with USB connection](images/IMG_4319%20Medium.jpeg) |
 
-## Prerequisites
+## Let a coding agent set it up
 
+Open or clone this repository in a **local coding agent with terminal and USB
+access**. Only the JC3248W535EN board above is supported. Plug it in with a USB
+data cable, then copy this prompt:
+
+> Read AGENTS.md and firmware/README.md. Set up my Quota Meter end to end:
+> install missing tools, compile and flash the firmware, configure Wi-Fi, and
+> help me log in to Codex and Claude with fresh device-only sessions. Ask which
+> providers and account labels I want. Automatically select the only compatible
+> USB device; ask me to choose only if ambiguous. Preserve existing Wi-Fi and
+> accounts, never erase them. Use the local Wi-Fi file or setup portal, not chat
+> for secrets. Guide me through browser account selection and login, then verify
+> live quotas on the display and status API. Continue without routine confirmations.
+
+You still plug in the board and complete browser account selection, consent,
+login and any 2FA. The agent cannot bypass those steps. If no compatible board is
+connected, it builds the firmware and asks you to plug it in. Never paste Wi-Fi
+passwords or provider tokens into chat.
+
+### Other copy-paste prompts
+
+Use these in the same repository; replace the example provider and account label
+as needed:
+
+- **Build only:** “Read AGENTS.md and firmware/README.md. Install missing build
+  tools and compile the firmware. Report the artifact path; do not flash or change
+  any device, Wi-Fi, or login.”
+- **Update firmware:** “Read AGENTS.md and firmware/README.md. Build and flash the
+  current checkout to my Quota Meter, preserving Wi-Fi and all accounts. Select
+  the only compatible USB device automatically; ask only if ambiguous. Do not
+  erase or log in again. Verify it boots and resumes quota polling.”
+- **Add an account:** “Read AGENTS.md and firmware/README.md. Add a Claude account
+  named Research Team to my display using a fresh device-only login. Have me
+  confirm the browser account. Preserve other accounts and verify new quotas.”
+- **Renew an account:** “Read AGENTS.md and firmware/README.md. Renew the Codex
+  account named Personal using a fresh device-only login and the exact same
+  provider/name. Preserve other accounts and verify new quotas.”
+- **Desktop only:** “Read AGENTS.md and README.md. Set up the desktop CLI, guide me
+  through `quota-meter login all`, then show my quotas. Do not flash or configure
+  a device, or reuse a device-owned session.”
+- **Diagnose:** “Read AGENTS.md and firmware/README.md. Diagnose why my display
+  has no fresh quotas using non-secret status. Check USB, Wi-Fi, time and provider
+  polling/backoff. Do not erase, clear accounts or log in again unless needed and
+  I explicitly request it. Explain what you verified and what remains blocked.”
+
+Account labels are local names, not proof of which browser account was used.
+Adding the same provider/name replaces that account; use a new name to add another.
+For manual hardware setup, see the [firmware guide](firmware/README.md).
+
+## Desktop CLI
+
+### Prerequisites
+
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
 - Python 3.11 or newer
 - [`codex`](https://developers.openai.com/codex/cli/) on `PATH` for OpenAI
 - [`claude`](https://code.claude.com/docs/en/overview) on `PATH` for Claude

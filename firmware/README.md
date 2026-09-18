@@ -12,24 +12,53 @@ panel), 16 MB QIO flash, 8 MB OPI PSRAM, and GPIO1 backlight.
 
 ## Build and test
 
-From the repository root:
+For agent-led setup, start with the [copy-paste prompts](../README.md#let-a-coding-agent-set-it-up)
+and [agent runbook](../AGENTS.md#agent-setup-and-maintenance-runbook).
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/). Native tests
+also require host `gcc` and `g++` on `PATH`; PlatformIO does not install them:
+
+- macOS: install Xcode Command Line Tools with `xcode-select --install`.
+- Debian/Ubuntu: install `build-essential` with your package manager.
+- Windows: follow [PlatformIO's native compiler setup](https://docs.platformio.org/en/latest/platforms/native.html#installation)
+  for MSYS2 and its compiler `PATH`.
+
+The shell examples use a POSIX shell. Adapt them to your terminal on Windows.
+Then run from the repository root (`uv sync` alone does not install PlatformIO
+or pyserial):
 
 ```sh
-pio test -d firmware -e native
-pio run -d firmware -e jc3248w535en
-pio run -d firmware -e jc3248w535en -t upload --upload-port "$ESPPORT"
-pio device monitor -d firmware --port "$ESPPORT" --baud 115200
+uv sync
+uv tool run --from platformio==6.1.19 pio test -d firmware -e native
+uv tool run --from platformio==6.1.19 pio run -d firmware -e jc3248w535en
 ```
 
-Erase all development credentials (destructive):
+These commands pin the tested PlatformIO Core 6.1.19. Core 6.2.0 currently fails
+with this ESP32 platform's SCons setup (`SCons.Tool.FortranCommon` is missing).
+
+
+Build-only stops at `firmware/.pio/build/jc3248w535en/firmware.bin`. For requested
+setup/updates, list ports with
+`uv tool run --from platformio==6.1.19 pio device list --json-output` and set `ESPPORT`
+to the sole compatible JC3248W535EN USB Serial/JTAG port (VID:PID `303A:1001`).
+Never hardcode a port or select Bluetooth/known mismatched boards; this USB ID is
+shared by other ESP32 boards. Ask which port only if ambiguous. With no compatible
+board connected, stop at the build and ask the user to plug in the correct board.
+Then flash without erasing Wi-Fi or accounts:
 
 ```sh
-pio run -d firmware -e jc3248w535en -t erase --upload-port "$ESPPORT"
+uv tool run --from platformio==6.1.19 pio run -d firmware -e jc3248w535en -t upload --upload-port "$ESPPORT"
 ```
 
-No upload port is hardcoded. The checked-in partition table uses one factory
-application, enlarged NVS, and a reserved `nvs_keys` partition; it deliberately
-has no OTA slots.
+Optional diagnostics, only when neither provisioning helper is running:
+
+```sh
+uv tool run --from platformio==6.1.19 pio device monitor -d firmware --port "$ESPPORT" --baud 115200
+```
+
+Close the monitor before flashing or provisioning: the console echoes secret
+input. Never erase flash or clear accounts unless explicitly requested. The
+checked-in partition table uses one factory application, enlarged NVS, and a
+reserved `nvs_keys` partition; it deliberately has no OTA slots.
 
 ## Wi-Fi provisioning
 
@@ -41,16 +70,18 @@ IP. Disconnects retry with a bounded 1–60 second backoff; if saved credentials
 remain unusable for 30 seconds, the setup AP returns.
 
 Wi-Fi can also be provisioned through the USB Serial/JTAG console at 115200
-baud. To avoid placing the password in shell history, copy `.env.example` to the
-ignored `.env`, set `WIFI_SSID` and `WIFI_PASSWORD`, then run:
+baud. Use the existing ignored `.env`; if absent, copy `.env.example` to a new
+`.env` and have the user set `WIFI_SSID` and `WIFI_PASSWORD` locally. Never overwrite
+an existing `.env`, print it, or ask for passwords in chat. Alternatively use the
+setup portal above. Close any serial monitor, then run:
 
 ```sh
-.venv/bin/python firmware/tools/provision_wifi.py --port "$ESPPORT"
+uv run --with pyserial python firmware/tools/provision_wifi.py --env-file .env --port "$ESPPORT"
 ```
 
-The helper requires `pyserial` (installed with PlatformIO in the development
-environment), auto-detects a single device with USB VID:PID `303A:1001` when
-`--port` is omitted, and never prints the password. The interactive REPL itself
+`uv run --with pyserial` supplies the helper's serial dependency without adding it
+to the project. The helper auto-detects a single device with USB VID:PID `303A:1001`
+when `--port` is omitted and never prints the password. The interactive REPL itself
 echoes typed input, so treat a live serial session as sensitive.
 
 The screen shows the authenticated settings URL as
@@ -95,22 +126,19 @@ Startup storage errors fail explicitly instead of erasing NVS automatically.
 Create fresh, separate logins for the device, not copies of desktop `auth.json`.
 [Codex authentication](https://developers.openai.com/codex/auth) supports
 `CODEX_HOME` and `cli_auth_credentials_store="file"`. Start with fresh directories
-and select the intended account in each browser login:
+and have the user confirm the intended account in each browser login, completing
+consent and any 2FA themselves. With the official Codex CLI installed, run in one
+shell (replace `Personal` with the desired local label):
 
 ```sh
-mkdir -p "$HOME/.codex-meter/bluefish" "$HOME/.codex-meter/personal"
-CODEX_HOME="$HOME/.codex-meter/bluefish" codex -c 'cli_auth_credentials_store="file"' login
-.venv/bin/python firmware/tools/upload_tokens.py --port "$ESPPORT" \
-  --provider codex --account Bluefish \
-  --codex-auth "$HOME/.codex-meter/bluefish/auth.json"
-
-CODEX_HOME="$HOME/.codex-meter/personal" codex -c 'cli_auth_credentials_store="file"' login
-.venv/bin/python firmware/tools/upload_tokens.py --port "$ESPPORT" \
-  --provider codex --account Personal \
-  --codex-auth "$HOME/.codex-meter/personal/auth.json"
+mkdir -p "$HOME/.codex-meter"
+CODEX_SESSION=$(mktemp -d "$HOME/.codex-meter/session.XXXXXX")
+CODEX_HOME="$CODEX_SESSION" codex -c 'cli_auth_credentials_store="file"' login
+uv run --with pyserial python firmware/tools/upload_tokens.py --port "$ESPPORT" \
+  --provider codex --account Personal --codex-auth "$CODEX_SESSION/auth.json"
 ```
 
-These commands leave the existing Bluefish desktop session in `~/.codex` alone.
+These commands leave the existing desktop session in `~/.codex` alone.
 After handing credentials to the device, do not run Codex or `codex logout` in
 these device-owned directories, or upload their old token files again. The device
 owns refresh-token rotation; sharing a login with a desktop client can cause
@@ -122,13 +150,16 @@ local label, not verification of which account you logged into.
 ### Dedicated Claude device sessions
 
 Use a fresh `CLAUDE_CONFIG_DIR` for each independently logged-in device account;
-never share a rotating session between independent clients. For example:
+never share a rotating session between independent clients. With the official
+Claude Code CLI installed, run in one shell; have the user confirm the intended
+browser account and complete consent and any 2FA:
 
 ```sh
-mkdir -p "$HOME/.claude-meter/research"
-CLAUDE_CONFIG_DIR="$HOME/.claude-meter/research" claude auth login
-CLAUDE_CONFIG_DIR="$HOME/.claude-meter/research" \
-  .venv/bin/python firmware/tools/upload_tokens.py --port "$ESPPORT" \
+mkdir -p "$HOME/.claude-meter"
+CLAUDE_SESSION=$(mktemp -d "$HOME/.claude-meter/session.XXXXXX")
+CLAUDE_CONFIG_DIR="$CLAUDE_SESSION" claude auth login --claudeai
+CLAUDE_CONFIG_DIR="$CLAUDE_SESSION" \
+  uv run --with pyserial python firmware/tools/upload_tokens.py --port "$ESPPORT" \
   --provider claude --account 'Research Team'
 ```
 
@@ -152,15 +183,17 @@ connected. Without explicit file overrides, the script reads:
 
 `--codex-auth` and `--claude-auth` override file locations for the selected
 provider. Mismatched provider/file flags are rejected before reading credentials.
-Prefer the dedicated Codex workflow above over the desktop discovery defaults.
+For hardware setup, always use the dedicated-session workflows above for both
+providers, never the default desktop credential locations.
 
 The serial protocol starts with `token-begin <codex|claude> <base64url-name>`;
 for example, `token-begin codex V29yayBUZWFt` targets `Work Team`. The unpadded
 base64url encoding avoids command injection through names. `token-chunk` and
 `token-commit` follow; metadata alone never creates a persisted account.
 
-The USB command `accounts-clear` deletes all provider credentials and cached quotas,
-including legacy imports, then restarts. Wi-Fi and setup settings are preserved.
+Only on an explicit request, the USB command `accounts-clear` deletes all provider
+credentials and cached quotas, including legacy imports, then restarts. Wi-Fi and
+setup settings are preserved.
 This is logical NVS deletion, not a forensic secure erase of flash.
 
 The script validates the target and bundle before opening the serial port, uses
@@ -178,6 +211,18 @@ when needed; rotated tokens are persisted before use. Rejected or
 expired credentials remain visible on their own page and must be replaced by
 rerunning the upload script. Each account independently honors `Retry-After` and
 retains cached quotas on failures.
+
+After the USB helpers finish, open the serial monitor above and enter `status`
+to discover the device IP, Wi-Fi state, and per-account status. Close the monitor
+again before any later credential upload.
+
+
+After upload, verify the intended provider/name on the display and at
+`http://<device-ip>/api/status`: check auth/quota state and a fresh `fetched_at`
+after the provider's polling turn. Upload success alone is not proof of working
+quotas. If stale, check Wi-Fi and SNTP time, then allow polling/backoff; 429 or a
+network failure is not a reason to immediately log in again. Report pending or
+blocked verification instead of claiming success.
 
 All upstream calls wait for plausible SNTP time, use ESP-IDF's certificate
 bundle with hostname verification, and cap response bodies at 16 KiB. Tokens,
